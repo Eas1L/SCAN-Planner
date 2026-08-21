@@ -21,6 +21,7 @@ constexpr double kMaxVYawLimit = 1.0;
 
 ros::Publisher cmd_vel_pub;
 ros::Publisher execution_frozen_pub;
+ros::Publisher trajectory_active_pub;
 ros::Subscriber bspline_sub;
 ros::Subscriber odom_sub;
 ros::Timer cmd_timer;
@@ -129,6 +130,13 @@ void publishExecutionFrozen(bool frozen)
   execution_frozen_pub.publish(msg);
 }
 
+void publishTrajectoryActive(bool active)
+{
+  std_msgs::Bool msg;
+  msg.data = active;
+  trajectory_active_pub.publish(msg);
+}
+
 void bsplineCallback(const scan_planner::BsplineConstPtr &msg)
 {
   Eigen::MatrixXd pos_pts(3, msg->pos_pts.size());
@@ -157,6 +165,7 @@ void bsplineCallback(const scan_planner::BsplineConstPtr &msg)
   exec_time = 0.0;
   last_update_time = ros::Time::now();
   receive_traj = true;
+  publishTrajectoryActive(true);
 
   ROS_WARN("[closed_loop_controller] received bspline traj_id=%d duration=%.3f", traj_id, traj_duration);
 }
@@ -219,7 +228,19 @@ void cmdCallback(const ros::TimerEvent &)
   cmd.angular.z = vyaw_cmd;
 
   if (exec_time >= traj_duration && pos_err.norm() < finish_dist)
-    cmd = geometry_msgs::Twist();
+  {
+    const int finished_traj_id = traj_id;
+    receive_traj = false;
+    traj.clear();
+    traj_duration = 0.0;
+    exec_time = 0.0;
+    publishExecutionFrozen(false);
+    publishStop();
+    publishTrajectoryActive(false);
+    ROS_INFO("[closed_loop_controller] trajectory %d reached within %.3f m; released target.",
+             finished_traj_id, finish_dist);
+    return;
+  }
 
   cmd_vel_pub.publish(cmd);
 }
@@ -234,13 +255,15 @@ int main(int argc, char **argv)
   if (!loadParams(nh))
     return 1;
 
-  bspline_sub = node.subscribe("planning/bspline", 10, bsplineCallback);
-  odom_sub = node.subscribe(body_pose_topic, 20, odomCallback, ros::TransportHints().tcpNoDelay());
   cmd_vel_pub = node.advertise<geometry_msgs::Twist>("cmd_vel", 20);
   execution_frozen_pub = node.advertise<std_msgs::Bool>("planning/go2_execution_frozen", 10);
+  trajectory_active_pub = node.advertise<std_msgs::Bool>("planning/trajectory_active", 1, true);
+  bspline_sub = node.subscribe("planning/bspline", 10, bsplineCallback);
+  odom_sub = node.subscribe(body_pose_topic, 20, odomCallback, ros::TransportHints().tcpNoDelay());
   cmd_timer = node.createTimer(ros::Duration(0.01), cmdCallback);
 
   last_update_time = ros::Time::now();
+  publishTrajectoryActive(false);
   ROS_WARN("[closed_loop_controller] ready.");
 
   ros::spin();

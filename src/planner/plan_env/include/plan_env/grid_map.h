@@ -8,6 +8,7 @@
 #include <cmath>
 #include <geometry_msgs/PoseStamped.h>
 #include <iostream>
+#include <nav_msgs/OccupancyGrid.h>
 #include <random>
 #include <nav_msgs/Odometry.h>
 #include <queue>
@@ -89,6 +90,10 @@ struct MappingParameters {
   bool cloud_is_world_;
   bool need_extrinsic_;
   Eigen::Matrix4d lidar_extrinsic_;
+  bool self_filter_enabled_;
+  double self_filter_padding_;
+  double near_ground_filter_range_;
+  double near_ground_filter_height_;
   Eigen::Matrix4d depth_extrinsic_;
 
   /* active mapping */
@@ -110,6 +115,8 @@ struct MappingData {
   Eigen::Vector3d ray_pos_;
   Eigen::Quaterniond ray_q_;
   Eigen::Vector3d sliding_map_frame_pos_;
+  Eigen::Quaterniond sliding_map_frame_q_;
+  bool has_sliding_map_frame_pose_;
 
   // depth image data
 
@@ -180,6 +187,7 @@ public:
 
   void publishMap();
   void publishMapInflate(bool all_info = false);
+  void publishPlannerBev(const ros::TimerEvent& /*event*/);
 
   void publishUnknown();
   void publishDepth();
@@ -254,10 +262,11 @@ private:
   SynchronizerImagePose sync_image_pose_;
 
   ros::Subscriber lidar_pose_sub_, sliding_map_frame_sub_, cloud_sub_;
-  ros::Publisher map_pub_, map_inf_pub_, sliding_map_bbox_pub_;
+  ros::Publisher map_pub_, map_inf_pub_, planner_bev_pub_, sliding_map_bbox_pub_;
   ros::Publisher unknown_pub_;
   ros::Publisher depth_cloud_pub_, extrinsic_pose_pub_;
-  ros::Timer occ_timer_, vis_timer_;
+  ros::Timer occ_timer_, vis_timer_, planner_bev_timer_;
+  ros::Time last_sensor_stamp_, last_map_update_stamp_;
 
   //
   uniform_real_distribution<double> rand_noise_;

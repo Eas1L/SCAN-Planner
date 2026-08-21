@@ -12,6 +12,7 @@ find_package(OpenCV REQUIRED)
 find_package(catkin REQUIRED COMPONENTS
   roscpp
   rospy
+  nav_msgs
   std_msgs
   visualization_msgs
   cv_bridge
@@ -25,7 +26,7 @@ find_package(PCL 1.7 REQUIRED)
 catkin_package(
  INCLUDE_DIRS include
  LIBRARIES plan_env
- CATKIN_DEPENDS roscpp std_msgs tf
+ CATKIN_DEPENDS roscpp nav_msgs std_msgs tf
 #  DEPENDS system_lib
 )
 

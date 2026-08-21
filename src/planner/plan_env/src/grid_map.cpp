@@ -9,7 +9,7 @@ void GridMap::initMap(ros::NodeHandle &nh)
   node_ = nh;
 
   /* get parameter */
-  double x_size, y_size, z_size;
+  double x_size, y_size, z_size, planner_bev_publish_period, visualization_publish_period;
   node_.param("grid_map/resolution", mp_.resolution_, -1.0);
   node_.param("grid_map/sliding_map_size_x", x_size, -1.0);
   node_.param("grid_map/sliding_map_size_y", y_size, -1.0);
@@ -49,10 +49,16 @@ void GridMap::initMap(ros::NodeHandle &nh)
   node_.param("grid_map/frame_id", mp_.frame_id_, string("world"));
   node_.param("grid_map/sliding_map_frame_id", mp_.sliding_map_frame_id_, string("sliding_map"));
   node_.param("grid_map/ground_height", mp_.ground_height_, 0.0);
+  node_.param("grid_map/planner_bev_publish_period", planner_bev_publish_period, 0.5);
+  node_.param("grid_map/visualization_publish_period", visualization_publish_period, 0.05);
 
   node_.param("grid_map/sensor_type", mp_.sensor_type_, string("lidar"));
   node_.param("grid_map/cloud_is_world", mp_.cloud_is_world_, true);
   node_.param("grid_map/need_extrinsic", mp_.need_extrinsic_, true);
+  node_.param("grid_map/self_filter_enabled", mp_.self_filter_enabled_, false);
+  node_.param("grid_map/self_filter_padding", mp_.self_filter_padding_, 0.0);
+  node_.param("grid_map/near_ground_filter_range", mp_.near_ground_filter_range_, 0.0);
+  node_.param("grid_map/near_ground_filter_height", mp_.near_ground_filter_height_, -0.05);
 
   mp_.lidar_extrinsic_ <<
       1.0, 0.0, 0.0, -0.01100,
@@ -145,15 +151,19 @@ void GridMap::initMap(ros::NodeHandle &nh)
       node_.subscribe<nav_msgs::Odometry>("/grid_map/body_pose", 50, &GridMap::slidingMapFrameCallback, this);
 
   occ_timer_ = node_.createTimer(ros::Duration(0.05), &GridMap::updateOccupancyCallback, this);
-  vis_timer_ = node_.createTimer(ros::Duration(0.05), &GridMap::visCallback, this);
-
+  vis_timer_ = node_.createTimer(
+      ros::Duration(std::max(0.05, visualization_publish_period)), &GridMap::visCallback, this);
   map_pub_ = node_.advertise<sensor_msgs::PointCloud2>("/grid_map/occupancy", 10);
   map_inf_pub_ = node_.advertise<sensor_msgs::PointCloud2>("/grid_map/occupancy_inflate", 10);
+  planner_bev_pub_ = node_.advertise<nav_msgs::OccupancyGrid>("/grid_map/planner_bev", 1, true);
   sliding_map_bbox_pub_ = node_.advertise<visualization_msgs::Marker>("/grid_map/sliding_map_bbox", 10);
 
   unknown_pub_ = node_.advertise<sensor_msgs::PointCloud2>("/grid_map/unknown", 10);
   depth_cloud_pub_ = node_.advertise<sensor_msgs::PointCloud2>("/grid_map/depth_cloud", 10);
   extrinsic_pose_pub_ = node_.advertise<nav_msgs::Odometry>("/grid_map/sensor_pose_extrinsic", 10);
+  if (planner_bev_publish_period > 0.0)
+    planner_bev_timer_ = node_.createTimer(
+        ros::Duration(planner_bev_publish_period), &GridMap::publishPlannerBev, this);
 
   md_.occ_need_update_ = false;
   md_.use_cloud_update_ = false;
@@ -164,10 +174,14 @@ void GridMap::initMap(ros::NodeHandle &nh)
   md_.ray_pos_.setZero();
   md_.sliding_map_frame_pos_.setZero();
   md_.ray_q_ = Eigen::Quaterniond::Identity();
+  md_.sliding_map_frame_q_ = Eigen::Quaterniond::Identity();
+  md_.has_sliding_map_frame_pose_ = false;
 
   md_.fuse_time_ = 0.0;
   md_.update_num_ = 0;
   md_.max_fuse_time_ = 0.0;
+  last_sensor_stamp_ = ros::Time();
+  last_map_update_stamp_ = ros::Time();
   md_.local_bound_min_ = mp_.map_bound_min_idx_;
   md_.local_bound_max_ = mp_.map_bound_max_idx_;
 
@@ -737,6 +751,7 @@ void GridMap::updateOccupancyCallback(const ros::TimerEvent & /*event*/)
     projectDepthImage();
   // t2 = ros::Time::now();
   raycastProcess();
+  last_map_update_stamp_ = last_sensor_stamp_.isZero() ? ros::Time::now() : last_sensor_stamp_;
   // t3 = ros::Time::now();
 
   // t4 = ros::Time::now();
@@ -760,6 +775,8 @@ void GridMap::depthPoseCallback(const sensor_msgs::ImageConstPtr &img,
 {
   if (mp_.sensor_type_ != "depth")
     return;
+
+  last_sensor_stamp_ = img->header.stamp;
 
   /* get depth image */
   cv_bridge::CvImagePtr cv_ptr;
@@ -851,6 +868,14 @@ void GridMap::slidingMapFrameCallback(const nav_msgs::OdometryConstPtr &pose)
 {
   const geometry_msgs::Point &pos = pose->pose.pose.position;
   md_.sliding_map_frame_pos_ = Eigen::Vector3d(pos.x, pos.y, pos.z);
+  const geometry_msgs::Quaternion &orientation = pose->pose.pose.orientation;
+  Eigen::Quaterniond body_q(
+      orientation.w, orientation.x, orientation.y, orientation.z);
+  if (body_q.norm() < 1e-6)
+    return;
+  body_q.normalize();
+  md_.sliding_map_frame_q_ = body_q;
+  md_.has_sliding_map_frame_pose_ = true;
 }
 
 void GridMap::cloudCallback(const sensor_msgs::PointCloud2ConstPtr &img)
@@ -872,6 +897,8 @@ void GridMap::cloudCallback(const sensor_msgs::PointCloud2ConstPtr &img)
   if (latest_cloud.points.size() == 0)
     return;
 
+  last_sensor_stamp_ = img->header.stamp;
+
   const Eigen::Matrix3d sensor_r = md_.ray_q_.toRotationMatrix();
   const Eigen::Vector3d ray_pos = md_.ray_pos_;
   if (!std::isfinite(ray_pos.x()) || !std::isfinite(ray_pos.y()) || !std::isfinite(ray_pos.z()))
@@ -887,6 +914,13 @@ void GridMap::cloudCallback(const sensor_msgs::PointCloud2ConstPtr &img)
     if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z))
       continue;
 
+    const Eigen::Vector3d pt_sensor(pt.x, pt.y, pt.z);
+    // Odin's organized cloud represents invalid returns as finite (0,0,0)
+    // samples. Reject invalid/near-origin sensor-frame points before they are
+    // transformed to the LiDAR mounting position and inflated as obstacles.
+    if (!mp_.cloud_is_world_ && pt_sensor.norm() < mp_.depth_filter_mindist_)
+      continue;
+
     Eigen::Vector3d pt_world;
     if (mp_.cloud_is_world_)
     {
@@ -894,8 +928,31 @@ void GridMap::cloudCallback(const sensor_msgs::PointCloud2ConstPtr &img)
     }
     else
     {
-      const Eigen::Vector3d pt_sensor(pt.x, pt.y, pt.z);
       pt_world = sensor_r * pt_sensor + ray_pos;
+    }
+
+    if (mp_.self_filter_enabled_ && md_.has_sliding_map_frame_pose_)
+    {
+      const Eigen::Vector3d pt_body =
+          md_.sliding_map_frame_q_.inverse() * (pt_world - md_.sliding_map_frame_pos_);
+      const double filter_padding = std::max(0.0, mp_.self_filter_padding_);
+      const double self_radius = std::max(0.0, mp_.double_cylinder_radius_) + filter_padding;
+      const double self_offset = std::max(0.0, mp_.double_cylinder_offset_);
+      const bool inside_self_height =
+          pt_body.z() >= -mp_.obstacles_inflation_z_down - filter_padding &&
+          pt_body.z() <= mp_.obstacles_inflation_z_up + filter_padding;
+      const double front_dist = std::hypot(pt_body.x() - self_offset, pt_body.y());
+      const double rear_dist = std::hypot(pt_body.x() + self_offset, pt_body.y());
+      if (inside_self_height && (front_dist <= self_radius || rear_dist <= self_radius))
+        continue;
+
+      // Odin produces a high-confidence near-field sheet that slopes from the
+      // sensor origin into the true floor. Remove only the low part of that
+      // sheet; nearby vertical obstacle returns at body height stay intact.
+      if (!mp_.cloud_is_world_ && mp_.near_ground_filter_range_ > 0.0 &&
+          pt_sensor.norm() < mp_.near_ground_filter_range_ &&
+          pt_body.z() < mp_.near_ground_filter_height_)
+        continue;
     }
     const Eigen::Vector3d devi = pt_world - ray_pos;
     const double ray_length = devi.norm();
@@ -1000,6 +1057,49 @@ void GridMap::publishMapInflate(bool all_info)
   map_inf_pub_.publish(cloud_msg);
 
   // ROS_INFO("pub map");
+}
+
+void GridMap::publishPlannerBev(const ros::TimerEvent & /*event*/)
+{
+  if (planner_bev_pub_.getNumSubscribers() <= 0 || !md_.has_ray_pose_ ||
+      !md_.has_sliding_map_frame_pose_)
+    return;
+
+  nav_msgs::OccupancyGrid grid;
+  grid.header.frame_id = mp_.frame_id_;
+  grid.header.stamp = last_map_update_stamp_.isZero() ? ros::Time::now() : last_map_update_stamp_;
+  grid.info.map_load_time = grid.header.stamp;
+  grid.info.resolution = mp_.resolution_;
+  grid.info.width = static_cast<uint32_t>(mp_.map_voxel_num_(0));
+  grid.info.height = static_cast<uint32_t>(mp_.map_voxel_num_(1));
+  grid.info.origin.position.x = mp_.map_min_boundary_(0);
+  grid.info.origin.position.y = mp_.map_min_boundary_(1);
+  grid.info.origin.position.z = 0.0;
+  grid.info.origin.orientation.w = 1.0;
+  grid.data.assign(grid.info.width * grid.info.height, -1);
+
+  double body_z = md_.sliding_map_frame_pos_(2);
+  if (!std::isfinite(body_z))
+    body_z = md_.ray_pos_(2);
+  Eigen::Vector3i body_idx;
+  posToIndex(Eigen::Vector3d(md_.sliding_map_frame_pos_(0),
+                             md_.sliding_map_frame_pos_(1), body_z), body_idx);
+  body_idx(2) = std::max(mp_.map_bound_min_idx_(2),
+                         std::min(body_idx(2), mp_.map_bound_max_idx_(2)));
+
+  size_t out = 0;
+  for (int y = mp_.map_bound_min_idx_(1); y <= mp_.map_bound_max_idx_(1); ++y)
+    for (int x = mp_.map_bound_min_idx_(0); x <= mp_.map_bound_max_idx_(0); ++x, ++out)
+    {
+      const Eigen::Vector3i idx(x, y, body_idx(2));
+      const int addr = toAddress(idx);
+      if (md_.occupancy_buffer_inflate_[addr] != 0)
+        grid.data[out] = 100;
+      else if (md_.occupancy_buffer_[addr] >= mp_.clamp_min_log_ - 1e-3)
+        grid.data[out] = 0;
+    }
+
+  planner_bev_pub_.publish(grid);
 }
 
 void GridMap::publishSlidingMapFrame()
