@@ -10,12 +10,14 @@ namespace scan_planner
   PlanningVisualization::PlanningVisualization(ros::NodeHandle &nh)
   {
     node = nh;
+    nh.param("grid_map/frame_id", frame_id_, std::string("world"));
 
     goal_point_pub = nh.advertise<visualization_msgs::Marker>("goal_point", 2);
     global_list_pub = nh.advertise<visualization_msgs::Marker>("global_list", 2);
     init_list_pub = nh.advertise<visualization_msgs::Marker>("init_list", 2);
     optimal_list_pub = nh.advertise<visualization_msgs::Marker>("optimal_list", 2);
     a_star_list_pub = nh.advertise<visualization_msgs::Marker>("a_star_list", 20);
+    planning_status_pub = nh.advertise<visualization_msgs::Marker>("planning_status", 2, true);
   }
 
   // // real ids used: {id, id+1000}
@@ -23,7 +25,7 @@ namespace scan_planner
                                                 Eigen::Vector4d color, int id)
   {
     visualization_msgs::Marker sphere, line_strip;
-    sphere.header.frame_id = line_strip.header.frame_id = "world";
+    sphere.header.frame_id = line_strip.header.frame_id = frame_id_;
     sphere.header.stamp = line_strip.header.stamp = ros::Time::now();
     sphere.type = visualization_msgs::Marker::SPHERE_LIST;
     line_strip.type = visualization_msgs::Marker::LINE_STRIP;
@@ -58,7 +60,7 @@ namespace scan_planner
                                                        const vector<Eigen::Vector3d> &list, double scale, Eigen::Vector4d color, int id)
   {
     visualization_msgs::Marker sphere, line_strip;
-    sphere.header.frame_id = line_strip.header.frame_id = "map";
+    sphere.header.frame_id = line_strip.header.frame_id = frame_id_;
     sphere.header.stamp = line_strip.header.stamp = ros::Time::now();
     sphere.type = visualization_msgs::Marker::SPHERE_LIST;
     line_strip.type = visualization_msgs::Marker::LINE_STRIP;
@@ -93,7 +95,7 @@ namespace scan_planner
                                                         const vector<Eigen::Vector3d> &list, double scale, Eigen::Vector4d color, int id)
   {
     visualization_msgs::Marker arrow;
-    arrow.header.frame_id = "map";
+    arrow.header.frame_id = frame_id_;
     arrow.header.stamp = ros::Time::now();
     arrow.type = visualization_msgs::Marker::ARROW;
     arrow.action = visualization_msgs::Marker::ADD;
@@ -134,16 +136,16 @@ namespace scan_planner
   void PlanningVisualization::displayGoalPoint(Eigen::Vector3d goal_point, Eigen::Vector4d color, const double scale, int id)
   {
     visualization_msgs::Marker sphere;
-    sphere.header.frame_id = "world";
+    sphere.header.frame_id = frame_id_;
     sphere.header.stamp = ros::Time::now();
     sphere.type = visualization_msgs::Marker::SPHERE;
     sphere.action = visualization_msgs::Marker::ADD;
     sphere.id = id;
 
     sphere.pose.orientation.w = 1.0;
-    sphere.color.r = 1.0;
-    sphere.color.g = 1.0;
-    sphere.color.b = 1.0;
+    sphere.color.r = color(0);
+    sphere.color.g = color(1);
+    sphere.color.b = color(2);
     sphere.color.a = color(3);
     sphere.scale.x = scale;
     sphere.scale.y = scale;
@@ -233,7 +235,7 @@ namespace scan_planner
     }
 
     visualization_msgs::Marker sphere, line_strip;
-    sphere.header.frame_id = line_strip.header.frame_id = "world";
+    sphere.header.frame_id = line_strip.header.frame_id = frame_id_;
     sphere.header.stamp = line_strip.header.stamp = ros::Time::now();
     sphere.type = visualization_msgs::Marker::SPHERE_LIST;
     line_strip.type = visualization_msgs::Marker::LINE_STRIP;
@@ -266,6 +268,43 @@ namespace scan_planner
 
     optimal_list_pub.publish(sphere);
     optimal_list_pub.publish(line_strip);
+  }
+
+  void PlanningVisualization::displayPlanningStatus(const Eigen::Vector3d &position,
+                                                     const std::string &text,
+                                                     const Eigen::Vector4d &color)
+  {
+    visualization_msgs::Marker marker;
+    marker.header.frame_id = frame_id_;
+    marker.header.stamp = ros::Time::now();
+    marker.ns = "planning_status";
+    marker.id = 0;
+    marker.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+    marker.action = visualization_msgs::Marker::ADD;
+    marker.pose.position.x = position(0);
+    marker.pose.position.y = position(1);
+    marker.pose.position.z = position(2) + 0.65;
+    marker.pose.orientation.w = 1.0;
+    marker.scale.z = 0.28;
+    marker.color.r = color(0);
+    marker.color.g = color(1);
+    marker.color.b = color(2);
+    marker.color.a = color(3);
+    marker.text = text;
+    marker.lifetime = ros::Duration(0.0);
+    planning_status_pub.publish(marker);
+  }
+
+  void PlanningVisualization::clearCurrentPlan()
+  {
+    visualization_msgs::Marker marker;
+    marker.header.frame_id = frame_id_;
+    marker.header.stamp = ros::Time::now();
+    marker.action = visualization_msgs::Marker::DELETEALL;
+    global_list_pub.publish(marker);
+    optimal_list_pub.publish(marker);
+    init_list_pub.publish(marker);
+    a_star_list_pub.publish(marker);
   }
 
   void PlanningVisualization::displayAStarList(std::vector<std::vector<Eigen::Vector3d>> a_star_paths, int id /* = Eigen::Vector4d(0.5,0.5,0,1)*/)

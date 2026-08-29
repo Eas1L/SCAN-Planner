@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <bspline_opt/uniform_bspline.h>
 #include <iostream>
+#include <string>
 #include <traj_utils/polynomial_traj.h>
 #include <ros/ros.h>
 #include <vector>
@@ -19,6 +20,7 @@ namespace scan_planner
   {
   private:
     ros::NodeHandle node;
+    std::string frame_id_;
 
     ros::Publisher goal_point_pub;
     ros::Publisher global_list_pub;
@@ -27,6 +29,7 @@ namespace scan_planner
     ros::Publisher a_star_list_pub;
     ros::Publisher guide_vector_pub;
     ros::Publisher intermediate_state_pub;
+    ros::Publisher planning_status_pub;
 
   public:
     PlanningVisualization(/* args */) {}
@@ -46,6 +49,9 @@ namespace scan_planner
     void displayInitPathList(vector<Eigen::Vector3d> init_pts, const double scale, int id);
     void displayOptimalList(Eigen::MatrixXd optimal_pts, int id);
     void displayOptimalTraj(UniformBspline position_traj, int id);
+    void displayPlanningStatus(const Eigen::Vector3d &position, const std::string &text,
+                               const Eigen::Vector4d &color);
+    void clearCurrentPlan();
     void displayAStarList(std::vector<std::vector<Eigen::Vector3d>> a_star_paths, int id);
     void displayArrowList(ros::Publisher &pub, const vector<Eigen::Vector3d> &list, double scale, Eigen::Vector4d color, int id);
     // void displayIntermediateState(ros::Publisher& intermediate_pub, scan_planner::BsplineOptimizer::Ptr optimizer, double sleep_time, const int start_iteration);

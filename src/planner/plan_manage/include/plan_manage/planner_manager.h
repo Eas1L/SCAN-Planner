@@ -37,6 +37,9 @@ namespace scan_planner
 
     void initPlanModules(ros::NodeHandle &nh, PlanningVisualization::Ptr vis = NULL);
 
+    int continuousFailuresCount() const { return continuous_failures_count_; }
+    void restoreContinuousFailuresCount(const int count) { continuous_failures_count_ = count; }
+
     PlanParameters pp_;
     LocalTrajData local_data_;
     GlobalTrajData global_data_;

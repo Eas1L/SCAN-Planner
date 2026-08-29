@@ -31,6 +31,11 @@ add_message_files(
   Bspline.msg
   DataDisp.msg
   )
+
+add_service_files(
+  FILES
+  CheckGoal.srv
+  )
   
 # Generate added messages and services with any dependencies listed here
 generate_messages(

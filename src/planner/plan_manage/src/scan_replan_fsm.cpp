@@ -46,6 +46,8 @@ namespace scan_planner
     nh.param("fsm/emergency_time_", emergency_time_, 1.0);
     nh.param("fsm/fail_safe", enable_fail_safe_, true);
     nh.param("fsm/max_replan_fail_count", max_replan_fail_count_, 1000);
+    nh.param("fsm/terminal_clearance", terminal_clearance_, 0.25);
+    terminal_clearance_ = std::max(0.0, terminal_clearance_);
     nh.param("grid_map/obstacles_inflation_z_up", self_inflation_z_up_, 0.0);
     nh.param("grid_map/obstacles_inflation_z_down", self_inflation_z_down_, 0.0);
     nh.param("grid_map/double_cylinder_radius", self_double_cylinder_radius_, 0.0);
@@ -99,6 +101,7 @@ namespace scan_planner
     bspline_pub_ = nh.advertise<scan_planner::Bspline>("/planning/bspline", 10);
     data_disp_pub_ = nh.advertise<scan_planner::DataDisp>("/planning/data_display", 100);
     self_inflation_pub_ = nh.advertise<visualization_msgs::Marker>("self_inflation", 10, true);
+    goal_check_srv_ = nh.advertiseService("check_goal", &SCANReplanFSM::checkGoalCallback, this);
 
     if (navi_mode_ == NAVI_MODE::MANUAL_TARGET)
       goal_sub_ = nh.subscribe("/move_base_simple/goal", 1, &SCANReplanFSM::rvizGoalCallback, this);
@@ -148,6 +151,8 @@ namespace scan_planner
     if (!rviz_height_ready_)
     {
       ROS_WARN("[SCANReplanFSM] Ignore RViz goal before receiving initial body pose.");
+      Eigen::Vector3d goal(msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
+      visualization_->displayPlanningStatus(goal, "PLAN FAILED: NO ODOM", Eigen::Vector4d(1.0, 0.1, 0.1, 1.0));
       return;
     }
 
@@ -165,7 +170,7 @@ namespace scan_planner
       return;
     }
 
-    if (msg->poses[0].pose.position.z < -0.1)
+    if (msg->poses[0].pose.position.z < -1.0)
       return;
 
     cout << "Triggered!" << endl;
@@ -174,12 +179,13 @@ namespace scan_planner
 
     bool success = false;
     end_pt_ << msg->poses[0].pose.position.x, msg->poses[0].pose.position.y, rviz_goal_height_;
+    visualization_->clearCurrentPlan();
+    visualization_->displayGoalPoint(end_pt_, Eigen::Vector4d(1.0, 0.8, 0.0, 1.0), 0.3, 0);
+    visualization_->displayPlanningStatus(end_pt_, "GOAL RECEIVED - PLANNING", Eigen::Vector4d(1.0, 0.8, 0.0, 1.0));
     success = planner_manager_->planGlobalTraj(odom_pos_, odom_vel_, Eigen::Vector3d::Zero(), end_pt_, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
 
     if (success)
       success = adjustGlobalTargetIfOccupied();
-
-    visualization_->displayGoalPoint(end_pt_, Eigen::Vector4d(0, 0.5, 0.5, 1), 0.3, 0);
 
     if (success)
     {
@@ -204,10 +210,14 @@ namespace scan_planner
         changeFSMExecState(REPLAN_TRAJ, "TRIG");
 
       // visualization_->displayGoalPoint(end_pt_, Eigen::Vector4d(1, 0, 0, 1), 0.3, 0);
+      visualization_->displayGoalPoint(end_pt_, Eigen::Vector4d(0.0, 0.8, 1.0, 1.0), 0.3, 0);
+      visualization_->displayPlanningStatus(end_pt_, "GLOBAL PATH OK - OPTIMIZING", Eigen::Vector4d(1.0, 0.8, 0.0, 1.0));
       visualization_->displayGlobalPathList(gloabl_traj, 0.1, 0);
     }
     else
     {
+      visualization_->displayGoalPoint(end_pt_, Eigen::Vector4d(1.0, 0.1, 0.1, 1.0), 0.3, 0);
+      visualization_->displayPlanningStatus(end_pt_, "PLAN FAILED: NO GLOBAL PATH", Eigen::Vector4d(1.0, 0.1, 0.1, 1.0));
       ROS_ERROR("Unable to generate global trajectory!");
     }
   }
@@ -331,6 +341,7 @@ namespace scan_planner
     if (final_occ <= 0)
       return true;
 
+    int first_free_idx = -1;
     for (int i = sample_num; i >= 0; --i)
     {
       const double t = duration * i / sample_num;
@@ -340,18 +351,50 @@ namespace scan_planner
 
       if (map->getInflateOccupancy(pt, estimateYawFromSegment(prev_pt, pt)) == 0)
       {
-        const Eigen::Vector3d raw_end = end_pt_;
-        end_pt_ = pt;
-        global_data.global_duration_ = t;
-        global_data.last_progress_time_ = std::min(global_data.last_progress_time_, t);
-        ROS_WARN("[global target] Target [%.2f, %.2f, %.2f] is occupied; use backward collision-free point [%.2f, %.2f, %.2f].",
-                 raw_end(0), raw_end(1), raw_end(2), end_pt_(0), end_pt_(1), end_pt_(2));
-        return true;
+        first_free_idx = i;
+        break;
       }
     }
 
-    ROS_ERROR("[global target] Target is occupied, and no collision-free point was found along the global trajectory.");
-    return false;
+    if (first_free_idx < 0)
+    {
+      ROS_ERROR("[global target] Target is occupied, and no collision-free point was found along the global trajectory.");
+      return false;
+    }
+
+    int target_idx = terminal_clearance_ <= 1e-6 ? first_free_idx : -1;
+    double backed_distance = 0.0;
+    Eigen::Vector3d previous_pt = global_data.global_traj_.evaluate(duration * first_free_idx / sample_num);
+    for (int i = first_free_idx - 1; i >= 0 && target_idx < 0; --i)
+    {
+      const double t = duration * i / sample_num;
+      const double prev_t = duration * std::max(0, i - 1) / sample_num;
+      const Eigen::Vector3d pt = global_data.global_traj_.evaluate(t);
+      const Eigen::Vector3d prev_pt = global_data.global_traj_.evaluate(prev_t);
+      backed_distance += (previous_pt - pt).norm();
+      previous_pt = pt;
+      if (backed_distance + 1e-6 >= terminal_clearance_ &&
+          map->getInflateOccupancy(pt, estimateYawFromSegment(prev_pt, pt)) == 0)
+        target_idx = i;
+    }
+
+    if (target_idx < 0)
+    {
+      ROS_ERROR("[global target] Found a collision-free boundary point, but the route cannot provide %.2f m terminal clearance.",
+                terminal_clearance_);
+      return false;
+    }
+
+    const Eigen::Vector3d raw_end = end_pt_;
+    const Eigen::Vector3d first_free = global_data.global_traj_.evaluate(duration * first_free_idx / sample_num);
+    const double target_t = duration * target_idx / sample_num;
+    end_pt_ = global_data.global_traj_.evaluate(target_t);
+    global_data.global_duration_ = target_t;
+    global_data.last_progress_time_ = std::min(global_data.last_progress_time_, target_t);
+    ROS_WARN("[global target] Target [%.2f, %.2f, %.2f] is occupied; first free [%.2f, %.2f, %.2f], use %.2f m-clearance target [%.2f, %.2f, %.2f].",
+             raw_end(0), raw_end(1), raw_end(2), first_free(0), first_free(1), first_free(2),
+             terminal_clearance_, end_pt_(0), end_pt_(1), end_pt_(2));
+    return true;
   }
 
   void SCANReplanFSM::pathCallback(const nav_msgs::PathConstPtr &msg)
@@ -425,11 +468,15 @@ namespace scan_planner
     odom_pos_(1) = msg->pose.pose.position.y;
     odom_pos_(2) = msg->pose.pose.position.z;
 
-    if (navi_mode_ == NAVI_MODE::MANUAL_TARGET && !rviz_height_ready_)
+    if (navi_mode_ == NAVI_MODE::MANUAL_TARGET)
     {
+      // A legged robot may start the sensor stack while crouched and stand up
+      // before receiving its first goal. Keep the manual planning plane on
+      // the current body height instead of freezing the first odometry z.
       rviz_goal_height_ = odom_pos_(2);
+      if (!rviz_height_ready_)
+        ROS_INFO("[SCANReplanFSM] Tracking manual goal height from body_pose z: %.3f", rviz_goal_height_);
       rviz_height_ready_ = true;
-      ROS_INFO("[SCANReplanFSM] Set RViz goal height from initial body_pose z: %.3f", rviz_goal_height_);
     }
 
     odom_vel_(0) = msg->twist.twist.linear.x;
@@ -450,6 +497,102 @@ namespace scan_planner
   void SCANReplanFSM::go2ExecutionFrozenCallback(const std_msgs::BoolConstPtr &msg)
   {
     go2_execution_frozen_ = msg->data;
+  }
+
+  bool SCANReplanFSM::checkGoalCallback(scan_planner::CheckGoal::Request &request,
+                                        scan_planner::CheckGoal::Response &response)
+  {
+    response.planned_goal = request.goal;
+    response.planned_goal.header.stamp = ros::Time::now();
+
+    if (navi_mode_ != NAVI_MODE::MANUAL_TARGET)
+    {
+      response.success = false;
+      response.message = "SCAN-Planner goal checking requires manual-target mode";
+      return true;
+    }
+    if (!have_odom_ || !rviz_height_ready_)
+    {
+      response.success = false;
+      response.message = "SCAN-Planner is waiting for body odometry";
+      return true;
+    }
+
+    // A VLM candidate must be checked by the same global and local planning
+    // algorithms used for execution, but a check must never publish a
+    // trajectory or alter the currently executing FSM. Save the planner/FSM
+    // trajectory state, run a deterministic attempt plus one randomized
+    // retry, then restore everything before returning the result.
+    const GlobalTrajData global_backup = planner_manager_->global_data_;
+    const LocalTrajData local_backup = planner_manager_->local_data_;
+    const int failure_count_backup = planner_manager_->continuousFailuresCount();
+    const Eigen::Vector3d start_pt_backup = start_pt_;
+    const Eigen::Vector3d start_vel_backup = start_vel_;
+    const Eigen::Vector3d start_acc_backup = start_acc_;
+    const Eigen::Vector3d end_pt_backup = end_pt_;
+    const Eigen::Vector3d end_vel_backup = end_vel_;
+    const Eigen::Vector3d local_target_pt_backup = local_target_pt_;
+    const Eigen::Vector3d local_target_vel_backup = local_target_vel_;
+
+    end_pt_ << request.goal.pose.position.x,
+        request.goal.pose.position.y,
+        rviz_goal_height_;
+    start_pt_ = odom_pos_;
+    start_vel_ = odom_vel_;
+    start_acc_.setZero();
+    end_vel_.setZero();
+
+    bool success = planner_manager_->planGlobalTraj(
+        start_pt_, start_vel_, start_acc_, end_pt_,
+        Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
+    std::string message;
+    if (!success)
+    {
+      message = "SCAN-Planner failed to generate a global trajectory";
+    }
+    else if (!adjustGlobalTargetIfOccupied())
+    {
+      success = false;
+      message = "SCAN-Planner found no collision-free target along the route";
+    }
+    else
+    {
+      getLocalTarget();
+      success = planner_manager_->reboundReplan(
+          start_pt_, start_vel_, start_acc_, local_target_pt_,
+          local_target_vel_, true, false);
+      if (!success)
+      {
+        success = planner_manager_->reboundReplan(
+            start_pt_, start_vel_, start_acc_, local_target_pt_,
+            local_target_vel_, true, true);
+      }
+      message = success
+                    ? "SCAN-Planner found a collision-free trajectory"
+                    : "SCAN-Planner failed to generate a collision-free local trajectory";
+    }
+
+    const Eigen::Vector3d planned_end = end_pt_;
+    planner_manager_->global_data_ = global_backup;
+    planner_manager_->local_data_ = local_backup;
+    planner_manager_->restoreContinuousFailuresCount(failure_count_backup);
+    start_pt_ = start_pt_backup;
+    start_vel_ = start_vel_backup;
+    start_acc_ = start_acc_backup;
+    end_pt_ = end_pt_backup;
+    end_vel_ = end_vel_backup;
+    local_target_pt_ = local_target_pt_backup;
+    local_target_vel_ = local_target_vel_backup;
+
+    response.success = success;
+    response.message = message;
+    response.planned_goal.pose.position.x = planned_end(0);
+    response.planned_goal.pose.position.y = planned_end(1);
+    response.planned_goal.pose.position.z = planned_end(2);
+    ROS_INFO("[goal check] candidate [%.2f, %.2f] -> %s: %s",
+             request.goal.pose.position.x, request.goal.pose.position.y,
+             success ? "accepted" : "rejected", message.c_str());
+    return true;
   }
 
   void SCANReplanFSM::updateLocalTrajTimeFreeze()
@@ -613,12 +756,19 @@ namespace scan_planner
       {
 
         replan_fail_count_ = 0;
+        visualization_->displayPlanningStatus(end_pt_, "PLAN OK", Eigen::Vector4d(0.1, 1.0, 0.2, 1.0));
         changeFSMExecState(EXEC_TRAJ, "FSM");
         flag_escape_emergency_ = true;
       }
       else
       {
         replan_fail_count_++;
+        if (replan_fail_count_ == 1 || replan_fail_count_ % 50 == 0)
+        {
+          visualization_->displayPlanningStatus(
+              end_pt_, "SEARCHING LOCAL PATH - RETRY " + std::to_string(replan_fail_count_),
+              Eigen::Vector4d(1.0, 0.5, 0.0, 1.0));
+        }
         changeFSMExecState(GEN_NEW_TRAJ, "FSM");
       }
       break;
@@ -630,6 +780,7 @@ namespace scan_planner
       if (planFromCurrentTraj())
       {
         replan_fail_count_ = 0;
+        visualization_->displayPlanningStatus(end_pt_, "REPLAN OK", Eigen::Vector4d(0.1, 1.0, 0.2, 1.0));
         changeFSMExecState(EXEC_TRAJ, "FSM");
       }
       else
@@ -690,6 +841,8 @@ namespace scan_planner
 
         have_target_ = false;
 
+        visualization_->displayPlanningStatus(end_pt_, "GOAL REACHED", Eigen::Vector4d(0.1, 1.0, 0.2, 1.0));
+
         changeFSMExecState(WAIT_TARGET, "FSM");
         return;
       }
@@ -747,6 +900,8 @@ namespace scan_planner
     if (replan_fail_count_ >= max_replan_fail_count_)
     {
       ROS_WARN("Replan failed %d times. Emergency stop and wait for a new target.", replan_fail_count_);
+      visualization_->displayGoalPoint(end_pt_, Eigen::Vector4d(1.0, 0.1, 0.1, 1.0), 0.3, 0);
+      visualization_->displayPlanningStatus(end_pt_, "PLAN FAILED: NO LOCAL PATH", Eigen::Vector4d(1.0, 0.1, 0.1, 1.0));
       replan_fail_count_ = 0;
       need_hover_stop_ = true;
       flag_escape_emergency_ = true;
