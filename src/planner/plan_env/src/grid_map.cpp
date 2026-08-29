@@ -57,6 +57,8 @@ void GridMap::initMap(ros::NodeHandle &nh)
   node_.param("grid_map/need_extrinsic", mp_.need_extrinsic_, true);
   node_.param("grid_map/self_filter_enabled", mp_.self_filter_enabled_, false);
   node_.param("grid_map/self_filter_padding", mp_.self_filter_padding_, 0.0);
+  node_.param("grid_map/footprint_clear_enabled", mp_.footprint_clear_enabled_, false);
+  node_.param("grid_map/footprint_clear_padding", mp_.footprint_clear_padding_, 0.0);
   node_.param("grid_map/near_ground_filter_range", mp_.near_ground_filter_range_, 0.0);
   node_.param("grid_map/near_ground_filter_height", mp_.near_ground_filter_height_, -0.05);
 
@@ -440,6 +442,89 @@ void GridMap::resetBuffer(Eigen::Vector3d min_pos, Eigen::Vector3d max_pos)
         resetCellByAddress(toAddress(x, y, z));
       }
     }
+}
+
+void GridMap::clearRobotFootprint()
+{
+  if (!mp_.footprint_clear_enabled_ || !md_.has_sliding_map_frame_pose_)
+    return;
+
+  const double padding = std::max(0.0, mp_.footprint_clear_padding_);
+  const double radius = std::max(0.0, mp_.double_cylinder_radius_) + padding;
+  const double offset = std::max(0.0, mp_.double_cylinder_offset_);
+
+  // A raw obstacle at z_source affects the planning slice at body_z iff its
+  // vertical inflation interval contains body_z. Clear exactly that source-z
+  // interval inside the physical double-cylinder footprint. The interval is
+  // expressed in the live body frame, so stairs and sidewalk height changes
+  // follow odometry z instead of relying on a fixed world ground height.
+  const double local_z_min = -std::max(0.0, mp_.obstacles_inflation_z_up) - padding;
+  const double local_z_max = std::max(0.0, mp_.obstacles_inflation_z_down) + padding;
+  const double local_z_center = 0.5 * (local_z_min + local_z_max);
+  const double local_z_half = 0.5 * (local_z_max - local_z_min);
+
+  const Eigen::Matrix3d body_r = md_.sliding_map_frame_q_.toRotationMatrix();
+  const Eigen::Vector3d local_box_center(0.0, 0.0, local_z_center);
+  const Eigen::Vector3d local_box_half(offset + radius, radius, local_z_half);
+  const Eigen::Vector3d world_box_center =
+      md_.sliding_map_frame_pos_ + body_r * local_box_center;
+  const Eigen::Vector3d world_box_half = body_r.cwiseAbs() * local_box_half;
+
+  Eigen::Vector3i min_id, max_id;
+  posToIndex(world_box_center - world_box_half, min_id);
+  posToIndex(world_box_center + world_box_half, max_id);
+  boundIndex(min_id);
+  boundIndex(max_id);
+
+  int cleared_occupied = 0;
+  for (int x = min_id(0); x <= max_id(0); ++x)
+    for (int y = min_id(1); y <= max_id(1); ++y)
+      for (int z = min_id(2); z <= max_id(2); ++z)
+      {
+        const Eigen::Vector3i id(x, y, z);
+        Eigen::Vector3d world_pos;
+        indexToPos(id, world_pos);
+        const Eigen::Vector3d body_pos =
+            md_.sliding_map_frame_q_.inverse() * (world_pos - md_.sliding_map_frame_pos_);
+        if (body_pos.z() < local_z_min || body_pos.z() > local_z_max)
+          continue;
+
+        const double front_dist = std::hypot(body_pos.x() - offset, body_pos.y());
+        const double rear_dist = std::hypot(body_pos.x() + offset, body_pos.y());
+        if (front_dist > radius && rear_dist > radius)
+          continue;
+
+        const int addr = toAddress(id);
+        if (md_.occupancy_buffer_[addr] > mp_.min_occupancy_log_)
+          ++cleared_occupied;
+        applyOccupancyUpdate(id, mp_.clamp_min_log_);
+        md_.count_hit_[addr] = 0;
+        md_.count_hit_and_miss_[addr] = 0;
+        md_.flag_rayend_[addr] = -1;
+        md_.flag_traverse_[addr] = -1;
+      }
+
+  if (cleared_occupied > 0)
+    ROS_WARN_THROTTLE(2.0,
+                      "[GridMap] cleared %d stale occupied voxels inside the live robot footprint.",
+                      cleared_occupied);
+}
+
+bool GridMap::isInsideRobotFootprintSlice(const Eigen::Vector3d& world_pos) const
+{
+  if (!mp_.footprint_clear_enabled_ || !md_.has_sliding_map_frame_pose_)
+    return false;
+
+  const Eigen::Vector3d body_pos =
+      md_.sliding_map_frame_q_.inverse() * (world_pos - md_.sliding_map_frame_pos_);
+  if (std::abs(body_pos.z()) > mp_.resolution_)
+    return false;
+
+  const double padding = std::max(0.0, mp_.footprint_clear_padding_);
+  const double radius = std::max(0.0, mp_.double_cylinder_radius_) + padding;
+  const double offset = std::max(0.0, mp_.double_cylinder_offset_);
+  return std::hypot(body_pos.x() - offset, body_pos.y()) <= radius ||
+         std::hypot(body_pos.x() + offset, body_pos.y()) <= radius;
 }
 
 int GridMap::setCacheOccupancy(Eigen::Vector3d pos, int occ)
@@ -876,6 +961,7 @@ void GridMap::slidingMapFrameCallback(const nav_msgs::OdometryConstPtr &pose)
   body_q.normalize();
   md_.sliding_map_frame_q_ = body_q;
   md_.has_sliding_map_frame_pose_ = true;
+  clearRobotFootprint();
 }
 
 void GridMap::cloudCallback(const sensor_msgs::PointCloud2ConstPtr &img)
@@ -1093,7 +1179,11 @@ void GridMap::publishPlannerBev(const ros::TimerEvent & /*event*/)
     {
       const Eigen::Vector3i idx(x, y, body_idx(2));
       const int addr = toAddress(idx);
-      if (md_.occupancy_buffer_inflate_[addr] != 0)
+      Eigen::Vector3d cell_pos;
+      indexToPos(idx, cell_pos);
+      if (isInsideRobotFootprintSlice(cell_pos))
+        grid.data[out] = 0;
+      else if (md_.occupancy_buffer_inflate_[addr] != 0)
         grid.data[out] = 100;
       else if (md_.occupancy_buffer_[addr] >= mp_.clamp_min_log_ - 1e-3)
         grid.data[out] = 0;

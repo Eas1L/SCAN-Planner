@@ -92,6 +92,8 @@ struct MappingParameters {
   Eigen::Matrix4d lidar_extrinsic_;
   bool self_filter_enabled_;
   double self_filter_padding_;
+  bool footprint_clear_enabled_;
+  double footprint_clear_padding_;
   double near_ground_filter_range_;
   double near_ground_filter_height_;
   Eigen::Matrix4d depth_extrinsic_;
@@ -237,6 +239,8 @@ private:
   void resetAllMapData();
   void resetCellByAddress(int addr);
   void resetCellByAddressForSliding(int addr, const std::vector<char>& clear_mask);
+  void clearRobotFootprint();
+  bool isInsideRobotFootprintSlice(const Eigen::Vector3d& world_pos) const;
   void hashIdToGlobalIndex(int addr, Eigen::Vector3i& id_g) const;
   void applyOccupancyUpdate(const Eigen::Vector3i& id, double new_log_odds);
   void rebuildInflationOffsets();
@@ -384,6 +388,11 @@ inline int GridMap::getInflateOccupancy(Eigen::Vector3d pos, double yaw) {
 
 inline int GridMap::getInflateOccupancyFromBuffer(Eigen::Vector3d pos, const std::vector<char>& buffer) {
   if (!isInMap(pos)) return -1;
+
+  // The live robot footprint is necessarily traversable at its current pose.
+  // Mask it at query time as well as removing stale raw sources, so inflation
+  // from a neighbouring voxel cannot leave the planner's start state trapped.
+  if (isInsideRobotFootprintSlice(pos)) return 0;
 
   Eigen::Vector3i id;
   posToIndex(pos, id);
