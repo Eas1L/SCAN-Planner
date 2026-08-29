@@ -1,0 +1,13 @@
+<launch>
+  <arg name="network_interface" default="enp4s0"/>
+  <arg name="use_wireless_gate" default="false"/>
+  <arg name="standup_on_start" default="true"/>
+  <arg name="cmd_timeout" default="0.5"/>
+
+  <node name="go2_cmdvel_bridge" pkg="unitree_go2_control" type="go2_cmdvel" output="screen">
+    <param name="network_interface" value="$(arg network_interface)"/>
+    <param name="use_wireless_gate" value="$(arg use_wireless_gate)"/>
+    <param name="standup_on_start" value="$(arg standup_on_start)"/>
+    <param name="cmd_timeout" value="$(arg cmd_timeout)"/>
+  </node>
+</launch>

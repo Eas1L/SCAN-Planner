@@ -29,7 +29,6 @@
 </p>
 
 ## 📢 News
-- **[Jul. 29, 2026]**: CAD files for our [sensor layout](https://github.com/zhechen003/GO2-EDU-sensor_layout) are now available.
 - **[Jul. 13, 2026]**: ROS2 support is now available from community! Thanks to [xiaoqi371317](https://github.com/xiaoqi371317) for contributing the ROS2 interface. Check out the [ros2-community](https://github.com/wuyi2121/SCAN-Planner/tree/ros2-community) branch.
 - **[Jul. 9, 2026]**:  Release the main algorithm of **SCAN-Planner**.
 
@@ -115,10 +114,6 @@ catkin_make -DUSE_GPU=ON
 ```
 
 The `use_gpu` option in [`simulator.xml`](src/planner/plan_manage/launch/simulator.xml) selects which sensing node to launch.
-
-## 🔩 Hardware
-
-To support the robotics community and enhance the reproducibility of our work, we provide CAD files for our [sensor layout](https://github.com/zhechen003/GO2-EDU-sensor_layout), available in ".SLDPRT" and ".STL" formats. These files can be opened and edited using Solidworks.
 
 ## 🤓 Acknowledgements
 We would like to express our gratitude to the following projects, which have provided significant support and inspiration for our work:

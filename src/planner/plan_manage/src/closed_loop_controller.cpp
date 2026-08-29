@@ -8,6 +8,7 @@
 #include <nav_msgs/Odometry.h>
 #include <ros/ros.h>
 #include <std_msgs/Bool.h>
+#include <std_msgs/Int32.h>
 #include <tf/tf.h>
 
 #include "bspline_opt/uniform_bspline.h"
@@ -18,15 +19,24 @@ namespace
 using scan_planner::UniformBspline;
 
 constexpr double kMaxVYawLimit = 1.0;
+constexpr int kRealFollowPath = 1;
+constexpr int kRosPlanAction = 2;
+constexpr int kRosPubAction = 4;
 
 ros::Publisher cmd_vel_pub;
 ros::Publisher execution_frozen_pub;
 ros::Subscriber bspline_sub;
 ros::Subscriber odom_sub;
+ros::Subscriber real_action_sub;
+ros::Subscriber ros_state_sub;
 ros::Timer cmd_timer;
 
 bool receive_traj = false;
 bool have_odom = false;
+bool have_real_action = false;
+bool motion_enabled = false;
+int real_action = 0;
+int ros_state = -1;
 std::vector<UniformBspline> traj;
 double traj_duration = 0.0;
 int traj_id = 0;
@@ -129,6 +139,61 @@ void publishExecutionFrozen(bool frozen)
   execution_frozen_pub.publish(msg);
 }
 
+void clearActiveTrajectory()
+{
+  receive_traj = false;
+  traj.clear();
+  traj_duration = 0.0;
+  exec_time = 0.0;
+  last_update_time = ros::Time::now();
+}
+
+void updateMotionGate(const char *source)
+{
+  const bool state_allows_motion =
+      ros_state >= kRosPlanAction && ros_state <= kRosPubAction;
+  const bool next_enabled =
+      have_real_action && real_action == kRealFollowPath && state_allows_motion;
+
+  if (next_enabled == motion_enabled)
+    return;
+
+  motion_enabled = next_enabled;
+  if (!motion_enabled)
+  {
+    clearActiveTrajectory();
+    publishExecutionFrozen(false);
+    publishStop();
+    ROS_WARN("[closed_loop_controller] motion disabled by %s "
+             "(real_action=%d ros_state=%d); trajectory cleared.",
+             source, real_action, ros_state);
+  }
+  else
+  {
+    last_update_time = ros::Time::now();
+    ROS_WARN("[closed_loop_controller] motion enabled by %s "
+             "(real_action=%d ros_state=%d).",
+             source, real_action, ros_state);
+  }
+}
+
+void realActionCallback(const std_msgs::Int32ConstPtr &msg)
+{
+  if (!msg)
+    return;
+  real_action = msg->data;
+  have_real_action = true;
+  updateMotionGate("/ros/real_action");
+}
+
+void rosStateCallback(const std_msgs::Int32ConstPtr &msg)
+{
+  if (!msg)
+    return;
+  ros_state = msg->data;
+  updateMotionGate("/ros/state");
+}
+
 void bsplineCallback(const scan_planner::BsplineConstPtr &msg)
 {
   Eigen::MatrixXd pos_pts(3, msg->pos_pts.size());
@@ -172,7 +237,7 @@ void odomCallback(const nav_msgs::OdometryConstPtr &msg)
 
 void cmdCallback(const ros::TimerEvent &)
 {
-  if (!receive_traj || !have_odom)
+  if (!motion_enabled || !receive_traj || !have_odom)
   {
     publishExecutionFrozen(false);
     publishStop();
@@ -236,6 +301,8 @@ int main(int argc, char **argv)
 
   bspline_sub = node.subscribe("planning/bspline", 10, bsplineCallback);
   odom_sub = node.subscribe(body_pose_topic, 20, odomCallback, ros::TransportHints().tcpNoDelay());
+  real_action_sub = node.subscribe("/ros/real_action", 10, realActionCallback);
+  ros_state_sub = node.subscribe("/ros/state", 10, rosStateCallback);
   cmd_vel_pub = node.advertise<geometry_msgs::Twist>("cmd_vel", 20);
   execution_frozen_pub = node.advertise<std_msgs::Bool>("planning/go2_execution_frozen", 10);
   cmd_timer = node.createTimer(ros::Duration(0.01), cmdCallback);

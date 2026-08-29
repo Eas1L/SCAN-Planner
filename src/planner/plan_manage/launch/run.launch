@@ -1,13 +1,15 @@
 <launch>
   <!-- real or sim -->
-  <arg name="is_real_world" default="false"/>
+  <arg name="is_real_world" default="true"/>
 
   <!-- navigation mode -->
   <!-- 1: use 2D Nav Goal to select final goal  -->
   <!-- 2: use keypoints to navigate in multi-floor scene -->
   <!-- 3: use reference path to follow and avoid obstacles -->
-  <arg name="navi_mode" default="1"/>
+  <arg name="navi_mode" default="3"/>
   <arg name="sensor_type" default="lidar"/>
+  <!-- Conservative default for real Go2 runs; override with max_vel:=... when needed. -->
+  <arg name="max_vel" default="0.35"/>
 
   <!-- body topic -->
   <arg name="body_pose_topic" value="$(eval '/LIO/odom_vehicle' if arg('is_real_world') else '/quad_0/body_pose')" />
@@ -34,6 +36,7 @@
 
     <arg name="is_real_world" value="$(arg is_real_world)"/>
     <arg name="navi_mode" value="$(arg navi_mode)" />
+    <arg name="max_vel" value="$(arg max_vel)" />
   </include>
 
   <!-- controller mode -->

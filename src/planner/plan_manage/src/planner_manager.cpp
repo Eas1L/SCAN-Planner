@@ -1,5 +1,7 @@
 // #include <fstream>
 #include <plan_manage/planner_manager.h>
+#include <algorithm>
+#include <cmath>
 #include <thread>
 
 namespace scan_planner
@@ -289,7 +291,7 @@ namespace scan_planner
         pos = UniformBspline(optimal_control_points, 3, ts);
     }
 
-    if (!flag_step_2_success || !checkDynamicFeasibility(pos))
+    if (!flag_step_2_success || !enforceDynamicFeasibility(pos))
     {
       printf("\033[34mThis refined trajectory is unsafe or dynamically infeasible. Skip publishing it.\n\033[0m");
       continuous_failures_count_++;
@@ -499,7 +501,7 @@ namespace scan_planner
     local_data_.traj_id_ += 1;
   }
 
-  bool SCANPlannerManager::checkDynamicFeasibility(UniformBspline position_traj)
+  bool SCANPlannerManager::checkDynamicFeasibility(UniformBspline position_traj, double &required_time_scale)
   {
     UniformBspline vel_traj = position_traj.getDerivative();
     UniformBspline acc_traj = vel_traj.getDerivative();
@@ -508,27 +510,98 @@ namespace scan_planner
     const double vel_limit = pp_.max_vel_ + pp_.vel_tolerance_;
     const double acc_limit = pp_.max_acc_ + pp_.acc_tolerance_;
 
+    required_time_scale = 1.0;
+    if (!std::isfinite(duration) || duration <= 0.0 ||
+        !std::isfinite(vel_limit) || vel_limit <= 0.0 ||
+        !std::isfinite(acc_limit) || acc_limit <= 0.0)
+    {
+      ROS_ERROR_STREAM("Dynamic feasibility check has invalid inputs: duration=" << duration
+                       << ", vel_limit=" << vel_limit << ", acc_limit=" << acc_limit);
+      return false;
+    }
+
+    double max_vel = 0.0;
+    double max_acc = 0.0;
+    double max_vel_time = 0.0;
+    double max_acc_time = 0.0;
+
     for (double t = 0.0; t < duration + 1e-6; t += sample_dt)
     {
       const double tc = std::min(t, duration);
-      Eigen::Vector3d vel = vel_traj.evaluateDeBoorT(tc);
-      if (vel.norm() > vel_limit)
+      const double vel = vel_traj.evaluateDeBoorT(tc).norm();
+      if (vel > max_vel)
       {
-        ROS_WARN_STREAM("Dynamic feasibility check failed: velocity limit exceeded at t="
-                        << tc << ", |v|=" << vel.norm() << " > " << vel_limit);
-        return false;
+        max_vel = vel;
+        max_vel_time = tc;
       }
 
-      Eigen::Vector3d acc = acc_traj.evaluateDeBoorT(tc);
-      if (acc.norm() > acc_limit)
+      const double acc = acc_traj.evaluateDeBoorT(tc).norm();
+      if (acc > max_acc)
       {
-        ROS_WARN_STREAM("Dynamic feasibility check failed: acceleration limit exceeded at t="
-                        << tc << ", |a|=" << acc.norm() << " > " << acc_limit);
-        return false;
+        max_acc = acc;
+        max_acc_time = tc;
       }
     }
 
-    return true;
+    if (!std::isfinite(max_vel) || !std::isfinite(max_acc))
+    {
+      ROS_ERROR_STREAM("Dynamic feasibility check produced non-finite values: max_vel="
+                       << max_vel << ", max_acc=" << max_acc);
+      return false;
+    }
+
+    required_time_scale = std::max(max_vel / vel_limit, std::sqrt(max_acc / acc_limit));
+    const bool velocity_feasible = max_vel <= vel_limit;
+    const bool acceleration_feasible = max_acc <= acc_limit;
+
+    if (!velocity_feasible)
+      ROS_WARN_STREAM("Dynamic feasibility check failed: velocity limit exceeded at t="
+                      << max_vel_time << ", |v|=" << max_vel << " > " << vel_limit);
+    if (!acceleration_feasible)
+      ROS_WARN_STREAM("Dynamic feasibility check failed: acceleration limit exceeded at t="
+                      << max_acc_time << ", |a|=" << max_acc << " > " << acc_limit);
+
+    return velocity_feasible && acceleration_feasible;
+  }
+
+  bool SCANPlannerManager::enforceDynamicFeasibility(UniformBspline &position_traj)
+  {
+    constexpr int max_time_scaling_attempts = 3;
+    constexpr double time_scaling_margin = 1.05;
+
+    for (int attempt = 0; attempt <= max_time_scaling_attempts; ++attempt)
+    {
+      double required_time_scale = 1.0;
+      if (checkDynamicFeasibility(position_traj, required_time_scale))
+        return true;
+
+      if (attempt == max_time_scaling_attempts ||
+          !std::isfinite(required_time_scale) || required_time_scale <= 1.0)
+      {
+        ROS_ERROR_STREAM("Unable to make refined trajectory dynamically feasible after "
+                         << attempt << " time-scaling attempt(s).");
+        return false;
+      }
+
+      const double applied_time_scale = std::max(1.01, required_time_scale * time_scaling_margin);
+      const double old_duration = position_traj.getTimeSum();
+
+      // Uniformly scale every knot around the active start knot. This preserves the
+      // spatial control points and collision clearance while velocity and acceleration
+      // decrease by 1/scale and 1/scale^2 respectively.
+      if (!position_traj.scaleTime(applied_time_scale))
+      {
+        ROS_ERROR_STREAM("Failed to scale refined trajectory time by " << applied_time_scale);
+        return false;
+      }
+
+      ROS_WARN_STREAM("Dynamic time scaling " << (attempt + 1) << "/"
+                      << max_time_scaling_attempts << ": scale=" << applied_time_scale
+                      << ", duration " << old_duration << " -> "
+                      << position_traj.getTimeSum());
+    }
+
+    return false;
   }
 
   void SCANPlannerManager::reparamBspline(UniformBspline &bspline, vector<Eigen::Vector3d> &start_end_derivative, double ratio,

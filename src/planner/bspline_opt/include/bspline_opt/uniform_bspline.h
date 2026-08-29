@@ -65,6 +65,7 @@ namespace scan_planner
     void setPhysicalLimits(const double &vel, const double &acc, const double &tolerance);
     bool checkFeasibility(double &ratio, bool show = false);
     void lengthenTime(const double &ratio);
+    bool scaleTime(const double &ratio);
 
     /* for performance evaluation */
 

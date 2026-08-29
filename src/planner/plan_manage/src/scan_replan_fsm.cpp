@@ -50,7 +50,7 @@ namespace scan_planner
     nh.param("grid_map/obstacles_inflation_z_down", self_inflation_z_down_, 0.0);
     nh.param("grid_map/double_cylinder_radius", self_double_cylinder_radius_, 0.0);
     nh.param("grid_map/double_cylinder_offset", self_double_cylinder_offset_, 0.0);
-    nh.param("grid_map/body_height", body_height_, 0.0);
+    nh.param("grid_map/body_height", body_height_, 0.5);
     nh.param("grid_map/frame_id", self_inflation_frame_id_, std::string("world"));
 
     if (navi_mode_ == NAVI_MODE::PRESET_TARGET)
@@ -95,6 +95,7 @@ namespace scan_planner
     ros::param::param<std::string>("/body_pose_topic", body_pose_topic, std::string("/quad_0/body_pose"));
     odom_sub_ = nh.subscribe(body_pose_topic, 1, &SCANReplanFSM::odometryCallback, this);
     go2_execution_frozen_sub_ = nh.subscribe("/planning/go2_execution_frozen", 10, &SCANReplanFSM::go2ExecutionFrozenCallback, this);
+    real_action_sub_ = nh.subscribe("/ros/real_action", 10, &SCANReplanFSM::realActionCallback, this);
 
     bspline_pub_ = nh.advertise<scan_planner::Bspline>("/planning/bspline", 10);
     data_disp_pub_ = nh.advertise<scan_planner::DataDisp>("/planning/data_display", 100);
@@ -214,14 +215,13 @@ namespace scan_planner
 
   bool SCANReplanFSM::planGlobalTrajByWaypoints(const std::vector<Eigen::Vector3d> &waypoints)
   {
-    if (waypoints.size() < 2)
+    if (waypoints.empty())
     {
-      ROS_WARN("[planGlobalTrajByWaypoints] Reference path requires at least two points.");
+      ROS_WARN("[planGlobalTrajByWaypoints] No waypoint to plan.");
       return false;
     }
 
     end_pt_ = waypoints.back();
-    std::vector<Eigen::Vector3d> reference_waypoints(waypoints.begin() + 1, waypoints.end());
 
     for (size_t i = 0; i < waypoints.size(); i++)
     {
@@ -230,10 +230,10 @@ namespace scan_planner
     }
 
     bool success = planner_manager_->planGlobalTrajWaypoints(
-        waypoints.front(),
+        odom_pos_,
+        odom_vel_,
         Eigen::Vector3d::Zero(),
-        Eigen::Vector3d::Zero(),
-        reference_waypoints,
+        waypoints,
         Eigen::Vector3d::Zero(),
         Eigen::Vector3d::Zero());
 
@@ -362,41 +362,19 @@ namespace scan_planner
       return;
     }
 
-    if (!have_odom_)
-    {
-      ROS_WARN_THROTTLE(1.0, "[pathCallback] No odometry yet, cannot plan global trajectory.");
-      return;
-    }
-
     trigger_ = true;
-    end_pt_ << msg->poses.back().pose.position.x,
-        msg->poses.back().pose.position.y,
-        msg->poses.back().pose.position.z + body_height_;
 
     std::vector<Eigen::Vector3d> waypoints;
     waypoints.reserve(msg->poses.size());
-    constexpr double min_dist = 0.5;
-    Eigen::Vector3d last_wp;
-    bool first = true;
 
-    for (const auto &pose_stamped : msg->poses)
+    for (const auto& pose_stamped : msg->poses)
     {
       Eigen::Vector3d wp;
       wp(0) = pose_stamped.pose.position.x;
       wp(1) = pose_stamped.pose.position.y;
-      wp(2) = pose_stamped.pose.position.z + body_height_;
-
-      if (first || (wp - last_wp).norm() >= min_dist)
-      {
-        waypoints.push_back(wp);
-        last_wp = wp;
-        first = false;
-      }
+      wp(2) = pose_stamped.pose.position.z + body_height_; // Adjust for body height
+      waypoints.push_back(wp);
     }
-
-    if ((waypoints.back() - end_pt_).norm() > 1e-6)
-      waypoints.push_back(end_pt_);
-
     bool success = planGlobalTrajByWaypoints(waypoints);
 
     if (success)
@@ -450,6 +428,35 @@ namespace scan_planner
   void SCANReplanFSM::go2ExecutionFrozenCallback(const std_msgs::BoolConstPtr &msg)
   {
     go2_execution_frozen_ = msg->data;
+  }
+
+  void SCANReplanFSM::realActionCallback(const std_msgs::Int32ConstPtr &msg)
+  {
+    constexpr int kRealStop = 0;
+    if (!msg || msg->data != kRealStop)
+      return;
+
+    const bool had_active_trajectory =
+        have_target_ || exec_state_ == GEN_NEW_TRAJ || exec_state_ == REPLAN_TRAJ ||
+        exec_state_ == EXEC_TRAJ || exec_state_ == EMERGENCY_STOP;
+
+    trigger_ = false;
+    have_target_ = false;
+    have_new_target_ = false;
+    go2_execution_frozen_ = false;
+    active_waypoints_.clear();
+    current_wp_ = 0;
+    replan_fail_count_ = 0;
+
+    // Publish a stationary B-spline as an explicit cancellation for trajectory
+    // consumers.  The closed-loop controller also gates on REAL_STOP.
+    if (had_active_trajectory && have_odom_)
+      callEmergencyStop(odom_pos_);
+
+    if (exec_state_ != INIT && exec_state_ != WAIT_TARGET)
+      changeFSMExecState(WAIT_TARGET, "REAL_STOP");
+
+    ROS_WARN("[REAL_STOP] Cleared active target and cancelled local trajectory.");
   }
 
   void SCANReplanFSM::updateLocalTrajTimeFreeze()
@@ -763,27 +770,6 @@ namespace scan_planner
 
     //cout << "info->velocity_traj_=" << info->velocity_traj_.get_control_points() << endl;
 
-    if (navi_mode_ == NAVI_MODE::REFERENCE_PATH)
-    {
-      start_pt_ = info->position_traj_.evaluateDeBoorT(t_cur);
-      start_vel_ = info->velocity_traj_.evaluateDeBoorT(t_cur);
-      start_acc_ = info->acceleration_traj_.evaluateDeBoorT(t_cur);
-
-      bool success = callReboundReplan(false, false);
-      if (!success)
-      {
-        success = callReboundReplan(true, false);
-        if (!success)
-        {
-          success = callReboundReplan(true, true);
-          if (!success)
-            return false;
-        }
-      }
-
-      return true;
-    }
-
     start_pt_ = odom_pos_;
     start_vel_ = info->velocity_traj_.evaluateDeBoorT(t_cur);
     start_acc_ = info->acceleration_traj_.evaluateDeBoorT(t_cur);
@@ -980,45 +966,45 @@ namespace scan_planner
 
   void SCANReplanFSM::getLocalTarget()
   {
-    const double max_vel = planner_manager_->pp_.max_vel_;
-    const double max_acc = planner_manager_->pp_.max_acc_;
-    const double duration = planner_manager_->global_data_.global_duration_;
-    double t_step = max_vel > 1e-6 ? planning_horizon_ / 20.0 / max_vel : 0.01;
-    t_step = std::max(t_step, 0.01);
+    double t;
 
-    double t_proj = 0.0;
-    double min_dist_to_start = 9999.0;
-    for (double t = 0.0; t < duration; t += t_step)
+    double t_step = planning_horizon_ / 20 / planner_manager_->pp_.max_vel_;
+    double dist_min = 9999, dist_min_t = 0.0;
+    double target_t = planner_manager_->global_data_.global_duration_;
+    for (t = planner_manager_->global_data_.last_progress_time_; t < planner_manager_->global_data_.global_duration_; t += t_step)
     {
       Eigen::Vector3d pos_t = planner_manager_->global_data_.getPosition(t);
-      double dist_to_start = (pos_t - start_pt_).norm();
-      if (dist_to_start < min_dist_to_start)
+      double dist = (pos_t - start_pt_).norm();
+
+      if (t < planner_manager_->global_data_.last_progress_time_ + 1e-5 && dist > planning_horizon_)
       {
-        min_dist_to_start = dist_to_start;
-        t_proj = t;
+        ROS_ERROR_STREAM("[getLocalTarget] last_progress_time mismatch: "
+                         << "dist_to_progress_pt=" << dist
+                         << ", planning_horizon=" << planning_horizon_
+                         << ", last_progress_time=" << planner_manager_->global_data_.last_progress_time_);
+        local_target_pt_ = pos_t;
+        target_t = t;
+        planner_manager_->global_data_.last_progress_time_ = t;
+        break;
       }
-    }
-
-    double target_t = duration;
-    double total_dist = 0.0;
-    bool target_found = false;
-    Eigen::Vector3d prev_pos = planner_manager_->global_data_.getPosition(t_proj);
-    local_target_pt_ = end_pt_;
-
-    for (double t = t_proj; t < duration; t += t_step)
-    {
-      Eigen::Vector3d pos_t = planner_manager_->global_data_.getPosition(t);
-      total_dist += (pos_t - prev_pos).norm();
-      if (total_dist >= planning_horizon_)
+      if (dist < dist_min)
+      {
+        dist_min = dist;
+        dist_min_t = t;
+      }
+      if (dist >= planning_horizon_)
       {
         local_target_pt_ = pos_t;
         target_t = t;
-        target_found = true;
+        planner_manager_->global_data_.last_progress_time_ = dist_min_t;
         break;
       }
-      prev_pos = pos_t;
     }
-    planner_manager_->global_data_.last_progress_time_ = target_found ? target_t : duration;
+    if (t > planner_manager_->global_data_.global_duration_) // Last global point
+    {
+      local_target_pt_ = end_pt_;
+      target_t = planner_manager_->global_data_.global_duration_;
+    }
 
     auto targetOccupancy = [&](const Eigen::Vector3d &pt) {
       return planner_manager_->grid_map_->getInflateOccupancy(pt, estimateYawFromSegment(odom_pos_, pt));
@@ -1045,7 +1031,7 @@ namespace scan_planner
         }
 
         double t_backward = target_t - dt;
-        if (t_backward >= std::max(0.0, t_proj))
+        if (t_backward >= std::max(0.0, dist_min_t))
         {
           Eigen::Vector3d pt = planner_manager_->global_data_.getPosition(t_backward);
           if (targetOccupancy(pt) == 0)
@@ -1069,7 +1055,7 @@ namespace scan_planner
       }
     }
 
-    if ((end_pt_ - local_target_pt_).norm() < (max_vel * max_vel) / (2 * max_acc))
+    if ((end_pt_ - local_target_pt_).norm() < (planner_manager_->pp_.max_vel_ * planner_manager_->pp_.max_vel_) / (2 * planner_manager_->pp_.max_acc_))
     {
       // local_target_vel_ = (end_pt_ - init_pt_).normalized() * planner_manager_->pp_.max_vel_ * (( end_pt_ - local_target_pt_ ).norm() / ((planner_manager_->pp_.max_vel_*planner_manager_->pp_.max_vel_)/(2*planner_manager_->pp_.max_acc_)));
       // cout << "A" << endl;
@@ -1078,8 +1064,6 @@ namespace scan_planner
     else
     {
       local_target_vel_ = planner_manager_->global_data_.getVelocity(target_t);
-      if (local_target_vel_.norm() > max_vel)
-        local_target_vel_ = local_target_vel_.normalized() * max_vel;
       // cout << "AA" << endl;
     }
   }

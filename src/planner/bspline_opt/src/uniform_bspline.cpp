@@ -1,4 +1,5 @@
 #include "bspline_opt/uniform_bspline.h"
+#include <cmath>
 #include <ros/ros.h>
 
 namespace scan_planner
@@ -203,6 +204,17 @@ namespace scan_planner
       u_(i) += double(i - num1) * t_inc;
     for (int i = num2 + 1; i < u_.rows(); ++i)
       u_(i) += delta_t;
+  }
+
+  bool UniformBspline::scaleTime(const double &ratio)
+  {
+    if (!std::isfinite(ratio) || ratio <= 0.0 || p_ < 0 || p_ >= u_.rows())
+      return false;
+
+    const double anchor = u_(p_);
+    u_ = ((u_.array() - anchor) * ratio + anchor).matrix();
+    interval_ *= ratio;
+    return true;
   }
 
   // void UniformBspline::recomputeInit() {}

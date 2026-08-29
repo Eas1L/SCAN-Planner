@@ -6,7 +6,7 @@
   <!-- initial state -->
   <arg name="init_x" default="$(eval -19.0 if arg('navi_mode') == 1 else -5.5)"/>
   <arg name="init_y" default="$(eval 1.0 if arg('navi_mode') == 1 else 5.5)"/>
-  <arg name="init_z" default="$(eval 0.25 if arg('navi_mode') == 1 else 0.5)"/>
+  <arg name="init_z" default="$(eval 0.3 if arg('navi_mode') == 1 else 0.5)"/>
   <param unless="$(arg is_real_world)" name="init_x" value="$(arg init_x)" type="double"/>
   <param unless="$(arg is_real_world)" name="init_y" value="$(arg init_y)" type="double"/>
   <param unless="$(arg is_real_world)" name="init_z" value="$(arg init_z)" type="double"/>
@@ -17,7 +17,7 @@
   <arg name="map_size_z" default="5.0"/>
 
   <!-- PCD map source -->
-  <arg name="use_pcd_map" default="false"/>
+  <arg name="use_pcd_map" default="true"/>
   <arg name="pcd_map_file" default="$(find map_generator)/resource/building.pcd"/>
   <arg name="pcd_frame_id" default="world"/>
   <arg name="pcd_publish_rate" default="0.2"/>

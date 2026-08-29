@@ -1,0 +1,11 @@
+fsm:
+  waypoint_num: 3
+  waypoint0_x: -5.5
+  waypoint0_y: -4.0
+  waypoint0_z: 2.0
+  waypoint1_x: 8.5
+  waypoint1_y: -4.0
+  waypoint1_z: 2.0
+  waypoint2_x: 8.5
+  waypoint2_y: 6.0
+  waypoint2_z: 3.5

@@ -11,6 +11,7 @@
 #include <ros/ros.h>
 #include <std_msgs/Bool.h>
 #include <std_msgs/Empty.h>
+#include <std_msgs/Int32.h>
 #include <vector>
 #include <visualization_msgs/Marker.h>
 
@@ -90,7 +91,7 @@ namespace scan_planner
     /* ROS utils */
     ros::NodeHandle node_;
     ros::Timer exec_timer_, safety_timer_;
-    ros::Subscriber goal_sub_, odom_sub_, path_sub_, go2_execution_frozen_sub_;
+    ros::Subscriber goal_sub_, odom_sub_, path_sub_, go2_execution_frozen_sub_, real_action_sub_;
     ros::Publisher replan_pub_, new_pub_, bspline_pub_, data_disp_pub_, self_inflation_pub_;
 
     /* helper functions */
@@ -124,6 +125,7 @@ namespace scan_planner
     void pathCallback(const nav_msgs::PathConstPtr &msg);
     void odometryCallback(const nav_msgs::OdometryConstPtr &msg);
     void go2ExecutionFrozenCallback(const std_msgs::BoolConstPtr &msg);
+    void realActionCallback(const std_msgs::Int32ConstPtr &msg);
 
     bool checkCollision();
 

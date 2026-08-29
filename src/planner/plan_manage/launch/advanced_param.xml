@@ -15,7 +15,7 @@
   <!-- public parameters -->
   <arg name="max_vel" default="0.75"/>
   <arg name="max_acc" default="0.5"/>
-  <arg name="planning_horizon" default="3.5"/>
+  <arg name="planning_horizon" default="7.5"/>
 
   <!-- main node -->
   <node pkg="scan_planner" name="scan_planner_node" type="scan_planner_node" output="screen" clear_params="true">
@@ -38,16 +38,15 @@
     <param name="fsm/is_real_world" value="$(arg is_real_world)" type="bool"/>
 
     <!-- sliding map -->
-    <param name="grid_map/resolution" value="0.05" />
+    <param name="grid_map/resolution" value="0.1" />
     <param name="grid_map/sliding_map_size_x" value="10.0" />
     <param name="grid_map/sliding_map_size_y" value="10.0" />
     <param name="grid_map/sliding_map_size_z" value="5.0" />
     <param name="grid_map/map_sliding_thresh" value="0.2"/>
-    <param name="grid_map/double_cylinder_radius" value="0.25" />
+    <param name="grid_map/double_cylinder_radius" value="0.3" />
     <param name="grid_map/double_cylinder_offset" value="0.18" />
     <param name="grid_map/obstacles_inflation_z_up" value="0.1" />
-    <param name="grid_map/obstacles_inflation_z_down" value="0.1" />
-    <param name="grid_map/body_height" value="0.4" />
+    <param name="grid_map/obstacles_inflation_z_down" value="0.4" />
 
     <!-- depth camera intrinsics -->
     <param name="grid_map/cx" value="$(arg cx)"/>
