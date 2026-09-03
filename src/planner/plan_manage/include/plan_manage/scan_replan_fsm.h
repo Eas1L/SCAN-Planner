@@ -2,9 +2,11 @@
 #define _SCAN_REPLAN_FSM_H_
 
 #include <Eigen/Eigen>
+#include <actionlib/server/simple_action_server.h>
 #include <algorithm>
 #include <geometry_msgs/PoseStamped.h>
 #include <iostream>
+#include <memory>
 #include <nav_msgs/Odometry.h>
 #include <nav_msgs/Path.h>
 #include <sensor_msgs/Imu.h>
@@ -19,6 +21,7 @@
 #include <scan_planner/Bspline.h>
 #include <scan_planner/CheckGoal.h>
 #include <scan_planner/DataDisp.h>
+#include <scan_planner/NavigateToPoseAction.h>
 #include <plan_manage/planner_manager.h>
 #include <traj_utils/planning_visualization.h>
 
@@ -89,11 +92,26 @@ namespace scan_planner
 
     bool flag_escape_emergency_;
 
+    /* AgenticNav navigation action state. SCAN is the sole authority for
+       geometric completion; the action is finished only after the controller
+       has released its final trajectory and the robot has stopped. */
+    using NavigateActionServer = actionlib::SimpleActionServer<scan_planner::NavigateToPoseAction>;
+    std::unique_ptr<NavigateActionServer> navigate_action_server_;
+    bool action_goal_active_;
+    bool action_goal_adjusted_;
+    bool action_saw_trajectory_active_;
+    bool controller_trajectory_active_;
+    bool action_terminal_pending_;
+    uint8_t action_terminal_code_;
+    std::string action_terminal_message_;
+    geometry_msgs::PoseStamped action_requested_goal_;
+    geometry_msgs::PoseStamped action_executed_goal_;
+
     /* ROS utils */
     ros::NodeHandle node_;
     ros::Timer exec_timer_, safety_timer_;
-    ros::Subscriber goal_sub_, odom_sub_, path_sub_, go2_execution_frozen_sub_;
-    ros::Publisher replan_pub_, new_pub_, bspline_pub_, data_disp_pub_, self_inflation_pub_;
+    ros::Subscriber goal_sub_, odom_sub_, path_sub_, go2_execution_frozen_sub_, trajectory_active_sub_;
+    ros::Publisher replan_pub_, new_pub_, bspline_pub_, data_disp_pub_, self_inflation_pub_, navigation_active_pub_;
     ros::ServiceServer goal_check_srv_;
 
     /* helper functions */
@@ -118,15 +136,24 @@ namespace scan_planner
     double getOdomYaw() const;
     double estimateYawFromSegment(const Eigen::Vector3d &from, const Eigen::Vector3d &to) const;
     void updateLocalTrajTimeFreeze();
+    bool startManualGoal(const geometry_msgs::PoseStamped &goal, bool from_action);
+    void updateActionExecutedGoal();
+    void publishActionFeedback(uint8_t phase, const std::string &message);
+    void queueActionTerminal(uint8_t completion_code, const std::string &message);
+    void finishActionTerminal();
+    void setNavigationActive(bool active);
 
     /* ROS functions */
     void execFSMCallback(const ros::TimerEvent &e);
     void checkCollisionCallback(const ros::TimerEvent &e);
     void rvizGoalCallback(const geometry_msgs::PoseStampedConstPtr &msg);
-    void waypointCallback(const nav_msgs::PathConstPtr &msg);
+    bool waypointCallback(const nav_msgs::PathConstPtr &msg);
     void pathCallback(const nav_msgs::PathConstPtr &msg);
     void odometryCallback(const nav_msgs::OdometryConstPtr &msg);
     void go2ExecutionFrozenCallback(const std_msgs::BoolConstPtr &msg);
+    void trajectoryActiveCallback(const std_msgs::BoolConstPtr &msg);
+    void navigationGoalCallback();
+    void navigationPreemptCallback();
     bool checkGoalCallback(scan_planner::CheckGoal::Request &request,
                            scan_planner::CheckGoal::Response &response);
 

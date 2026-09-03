@@ -10,6 +10,8 @@ find_package(Eigen3 REQUIRED)
 find_package(PCL 1.7 REQUIRED)
 
 find_package(catkin REQUIRED COMPONENTS
+  actionlib
+  actionlib_msgs
   roscpp
   std_msgs
   geometry_msgs
@@ -36,10 +38,16 @@ add_service_files(
   FILES
   CheckGoal.srv
   )
+
+add_action_files(
+  FILES
+  NavigateToPose.action
+  )
   
 # Generate added messages and services with any dependencies listed here
 generate_messages(
   DEPENDENCIES
+  actionlib_msgs
   std_msgs
   geometry_msgs
 )
@@ -48,7 +56,7 @@ generate_messages(
 catkin_package(
  INCLUDE_DIRS include
  LIBRARIES scan_planner
- CATKIN_DEPENDS plan_env path_searching bspline_opt traj_utils message_runtime
+ CATKIN_DEPENDS actionlib actionlib_msgs plan_env path_searching bspline_opt traj_utils message_runtime
 #  DEPENDS system_lib
 )
 

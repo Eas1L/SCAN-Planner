@@ -1,0 +1,28 @@
+geometry_msgs/PoseStamped target
+---
+uint8 REACHED_REQUESTED_GOAL=0
+uint8 REACHED_ADJUSTED_GOAL=1
+uint8 REJECTED_NO_GLOBAL_PATH=2
+uint8 ABORTED_NO_LOCAL_PATH=3
+uint8 CANCELED=4
+uint8 FAULT=5
+
+uint8 completion_code
+bool reached_requested_goal
+bool goal_adjusted
+string message
+geometry_msgs/PoseStamped requested_goal
+geometry_msgs/PoseStamped executed_goal
+geometry_msgs/PoseStamped final_pose
+float64 adjustment_distance
+float64 final_distance_to_requested
+---
+uint8 PLANNING=0
+uint8 EXECUTING=1
+uint8 REPLANNING=2
+uint8 STOPPING=3
+
+uint8 phase
+string message
+geometry_msgs/PoseStamped executed_goal
+uint32 replan_count

@@ -37,6 +37,16 @@ namespace scan_planner
     need_hover_stop_ = false;
     replan_fail_count_ = 0;
     last_freeze_update_time_ = ros::Time::now();
+    action_goal_active_ = false;
+    action_goal_adjusted_ = false;
+    action_saw_trajectory_active_ = false;
+    controller_trajectory_active_ = false;
+    action_terminal_pending_ = false;
+    action_terminal_code_ = scan_planner::NavigateToPoseResult::FAULT;
+    odom_pos_.setZero();
+    odom_vel_.setZero();
+    odom_acc_.setZero();
+    odom_orient_ = Eigen::Quaterniond::Identity();
 
     /*  fsm param  */
     nh.param("fsm/navi_mode", navi_mode_, -1);
@@ -97,11 +107,19 @@ namespace scan_planner
     ros::param::param<std::string>("/body_pose_topic", body_pose_topic, std::string("/quad_0/body_pose"));
     odom_sub_ = nh.subscribe(body_pose_topic, 1, &SCANReplanFSM::odometryCallback, this);
     go2_execution_frozen_sub_ = nh.subscribe("/planning/go2_execution_frozen", 10, &SCANReplanFSM::go2ExecutionFrozenCallback, this);
+    trajectory_active_sub_ = nh.subscribe("/planning/trajectory_active", 10, &SCANReplanFSM::trajectoryActiveCallback, this);
 
     bspline_pub_ = nh.advertise<scan_planner::Bspline>("/planning/bspline", 10);
     data_disp_pub_ = nh.advertise<scan_planner::DataDisp>("/planning/data_display", 100);
     self_inflation_pub_ = nh.advertise<visualization_msgs::Marker>("self_inflation", 10, true);
+    navigation_active_pub_ = nh.advertise<std_msgs::Bool>("/planning/navigation_active", 1, true);
     goal_check_srv_ = nh.advertiseService("check_goal", &SCANReplanFSM::checkGoalCallback, this);
+    setNavigationActive(false);
+
+    navigate_action_server_.reset(new NavigateActionServer(nh, "navigate", false));
+    navigate_action_server_->registerGoalCallback(boost::bind(&SCANReplanFSM::navigationGoalCallback, this));
+    navigate_action_server_->registerPreemptCallback(boost::bind(&SCANReplanFSM::navigationPreemptCallback, this));
+    navigate_action_server_->start();
 
     if (navi_mode_ == NAVI_MODE::MANUAL_TARGET)
       goal_sub_ = nh.subscribe("/move_base_simple/goal", 1, &SCANReplanFSM::rvizGoalCallback, this);
@@ -143,35 +161,224 @@ namespace scan_planner
     }
   }
 
+  void SCANReplanFSM::setNavigationActive(bool active)
+  {
+    std_msgs::Bool msg;
+    msg.data = active;
+    navigation_active_pub_.publish(msg);
+  }
+
+  void SCANReplanFSM::updateActionExecutedGoal()
+  {
+    if (!action_goal_active_)
+      return;
+
+    action_executed_goal_ = action_requested_goal_;
+    action_executed_goal_.header.stamp = ros::Time::now();
+    action_executed_goal_.pose.position.x = end_pt_(0);
+    action_executed_goal_.pose.position.y = end_pt_(1);
+    action_executed_goal_.pose.position.z = end_pt_(2);
+    const double dx = end_pt_(0) - action_requested_goal_.pose.position.x;
+    const double dy = end_pt_(1) - action_requested_goal_.pose.position.y;
+    const double dz = end_pt_(2) - action_requested_goal_.pose.position.z;
+    action_goal_adjusted_ = std::sqrt(dx * dx + dy * dy + dz * dz) > 1e-3;
+  }
+
+  void SCANReplanFSM::publishActionFeedback(uint8_t phase, const std::string &message)
+  {
+    if (!action_goal_active_ || !navigate_action_server_ || !navigate_action_server_->isActive())
+      return;
+
+    scan_planner::NavigateToPoseFeedback feedback;
+    feedback.phase = phase;
+    feedback.message = message;
+    feedback.executed_goal = action_executed_goal_;
+    feedback.replan_count = static_cast<uint32_t>(std::max(0, replan_fail_count_));
+    navigate_action_server_->publishFeedback(feedback);
+  }
+
+  void SCANReplanFSM::queueActionTerminal(uint8_t completion_code, const std::string &message)
+  {
+    if (!action_goal_active_ || action_terminal_pending_)
+      return;
+    action_terminal_pending_ = true;
+    action_terminal_code_ = completion_code;
+    action_terminal_message_ = message;
+    publishActionFeedback(scan_planner::NavigateToPoseFeedback::STOPPING, message);
+    if (!controller_trajectory_active_)
+      finishActionTerminal();
+  }
+
+  void SCANReplanFSM::finishActionTerminal()
+  {
+    if (!action_goal_active_ || !action_terminal_pending_ || controller_trajectory_active_ ||
+        !navigate_action_server_ || !navigate_action_server_->isActive())
+      return;
+
+    scan_planner::NavigateToPoseResult result;
+    result.completion_code = action_terminal_code_;
+    result.reached_requested_goal =
+        action_terminal_code_ == scan_planner::NavigateToPoseResult::REACHED_REQUESTED_GOAL;
+    result.goal_adjusted = action_goal_adjusted_;
+    result.message = action_terminal_message_;
+    result.requested_goal = action_requested_goal_;
+    result.executed_goal = action_executed_goal_;
+    result.final_pose.header.stamp = ros::Time::now();
+    result.final_pose.header.frame_id = action_requested_goal_.header.frame_id;
+    result.final_pose.pose.position.x = odom_pos_(0);
+    result.final_pose.pose.position.y = odom_pos_(1);
+    result.final_pose.pose.position.z = odom_pos_(2);
+    result.final_pose.pose.orientation.w = odom_orient_.w();
+    result.final_pose.pose.orientation.x = odom_orient_.x();
+    result.final_pose.pose.orientation.y = odom_orient_.y();
+    result.final_pose.pose.orientation.z = odom_orient_.z();
+
+    const double adjust_x = action_executed_goal_.pose.position.x - action_requested_goal_.pose.position.x;
+    const double adjust_y = action_executed_goal_.pose.position.y - action_requested_goal_.pose.position.y;
+    const double adjust_z = action_executed_goal_.pose.position.z - action_requested_goal_.pose.position.z;
+    result.adjustment_distance = std::sqrt(adjust_x * adjust_x + adjust_y * adjust_y + adjust_z * adjust_z);
+    const double final_x = odom_pos_(0) - action_requested_goal_.pose.position.x;
+    const double final_y = odom_pos_(1) - action_requested_goal_.pose.position.y;
+    const double final_z = odom_pos_(2) - action_requested_goal_.pose.position.z;
+    result.final_distance_to_requested = std::sqrt(final_x * final_x + final_y * final_y + final_z * final_z);
+
+    if (action_terminal_code_ == scan_planner::NavigateToPoseResult::REACHED_REQUESTED_GOAL ||
+        action_terminal_code_ == scan_planner::NavigateToPoseResult::REACHED_ADJUSTED_GOAL)
+      navigate_action_server_->setSucceeded(result, result.message);
+    else if (action_terminal_code_ == scan_planner::NavigateToPoseResult::CANCELED)
+      navigate_action_server_->setPreempted(result, result.message);
+    else
+      navigate_action_server_->setAborted(result, result.message);
+
+    ROS_INFO("[SCANReplanFSM] navigation action finished code=%u adjusted=%s distance_to_requested=%.3f: %s",
+             static_cast<unsigned int>(result.completion_code), result.goal_adjusted ? "true" : "false",
+             result.final_distance_to_requested, result.message.c_str());
+    action_goal_active_ = false;
+    action_terminal_pending_ = false;
+    action_saw_trajectory_active_ = false;
+    setNavigationActive(false);
+  }
+
+  void SCANReplanFSM::trajectoryActiveCallback(const std_msgs::BoolConstPtr &msg)
+  {
+    controller_trajectory_active_ = msg->data;
+    if (action_goal_active_ && msg->data)
+    {
+      action_saw_trajectory_active_ = true;
+      publishActionFeedback(scan_planner::NavigateToPoseFeedback::EXECUTING, "SCAN controller is executing a trajectory");
+    }
+    if (!msg->data)
+    {
+      finishActionTerminal();
+      if (!action_goal_active_ && exec_state_ == WAIT_TARGET)
+        setNavigationActive(false);
+    }
+  }
+
+  void SCANReplanFSM::navigationGoalCallback()
+  {
+    if (!navigate_action_server_ || !navigate_action_server_->isNewGoalAvailable())
+      return;
+
+    const scan_planner::NavigateToPoseGoalConstPtr goal = navigate_action_server_->acceptNewGoal();
+    action_goal_active_ = true;
+    action_goal_adjusted_ = false;
+    action_saw_trajectory_active_ = false;
+    action_terminal_pending_ = false;
+    action_terminal_message_.clear();
+    action_requested_goal_ = goal->target;
+    action_requested_goal_.header.stamp = ros::Time::now();
+    action_executed_goal_ = action_requested_goal_;
+    setNavigationActive(true);
+    publishActionFeedback(scan_planner::NavigateToPoseFeedback::PLANNING, "SCAN accepted the navigation goal");
+
+    if (!startManualGoal(action_requested_goal_, true))
+    {
+      updateActionExecutedGoal();
+      queueActionTerminal(scan_planner::NavigateToPoseResult::REJECTED_NO_GLOBAL_PATH,
+                          have_odom_ ? "SCAN could not generate a global path" : "SCAN has no odometry");
+    }
+    else
+    {
+      updateActionExecutedGoal();
+      publishActionFeedback(scan_planner::NavigateToPoseFeedback::PLANNING,
+                            action_goal_adjusted_ ? "SCAN adjusted the occupied goal and is planning" :
+                                                    "SCAN found a global path and is planning");
+    }
+  }
+
+  void SCANReplanFSM::navigationPreemptCallback()
+  {
+    if (!action_goal_active_ || action_terminal_pending_)
+      return;
+
+    queueActionTerminal(scan_planner::NavigateToPoseResult::CANCELED,
+                        "Navigation canceled by AgenticNav or the safety supervisor");
+    if (controller_trajectory_active_ && have_odom_)
+    {
+      need_hover_stop_ = true;
+      flag_escape_emergency_ = true;
+      changeFSMExecState(EMERGENCY_STOP, "ACTION_CANCEL");
+    }
+    else
+    {
+      have_target_ = false;
+      trigger_ = false;
+      changeFSMExecState(WAIT_TARGET, "ACTION_CANCEL");
+      finishActionTerminal();
+    }
+  }
+
   void SCANReplanFSM::rvizGoalCallback(const geometry_msgs::PoseStampedConstPtr &msg)
   {
     if (!msg)
       return;
 
-    if (!rviz_height_ready_)
+    if (action_goal_active_)
     {
-      ROS_WARN("[SCANReplanFSM] Ignore RViz goal before receiving initial body pose.");
-      Eigen::Vector3d goal(msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
-      visualization_->displayPlanningStatus(goal, "PLAN FAILED: NO ODOM", Eigen::Vector4d(1.0, 0.1, 0.1, 1.0));
+      ROS_WARN("[SCANReplanFSM] Ignore RViz goal while an AgenticNav action is active.");
       return;
     }
 
-    nav_msgs::PathPtr path(new nav_msgs::Path);
-    path->header = msg->header;
-    path->poses.push_back(*msg);
-    waypointCallback(path);
+    startManualGoal(*msg, false);
   }
 
-  void SCANReplanFSM::waypointCallback(const nav_msgs::PathConstPtr &msg)
+  bool SCANReplanFSM::startManualGoal(const geometry_msgs::PoseStamped &goal, bool from_action)
+  {
+    if (navi_mode_ != NAVI_MODE::MANUAL_TARGET)
+    {
+      ROS_WARN("[SCANReplanFSM] Reject manual navigation goal in navi_mode=%d.", navi_mode_);
+      return false;
+    }
+
+    if (!rviz_height_ready_)
+    {
+      ROS_WARN("[SCANReplanFSM] Ignore RViz goal before receiving initial body pose.");
+      Eigen::Vector3d goal_point(goal.pose.position.x, goal.pose.position.y, goal.pose.position.z);
+      visualization_->displayPlanningStatus(goal_point, "PLAN FAILED: NO ODOM", Eigen::Vector4d(1.0, 0.1, 0.1, 1.0));
+      return false;
+    }
+
+    nav_msgs::PathPtr path(new nav_msgs::Path);
+    path->header = goal.header;
+    path->poses.push_back(goal);
+    setNavigationActive(true);
+    const bool started = waypointCallback(path);
+    if (!started && !from_action)
+      setNavigationActive(false);
+    return started;
+  }
+
+  bool SCANReplanFSM::waypointCallback(const nav_msgs::PathConstPtr &msg)
   {
     if (!msg || msg->poses.empty())
     {
       ROS_WARN_THROTTLE(1.0, "[waypointCallback] Empty waypoint message, ignore.");
-      return;
+      return false;
     }
 
     if (msg->poses[0].pose.position.z < -1.0)
-      return;
+      return false;
 
     cout << "Triggered!" << endl;
     trigger_ = true;
@@ -220,6 +427,7 @@ namespace scan_planner
       visualization_->displayPlanningStatus(end_pt_, "PLAN FAILED: NO GLOBAL PATH", Eigen::Vector4d(1.0, 0.1, 0.1, 1.0));
       ROS_ERROR("Unable to generate global trajectory!");
     }
+    return success;
   }
 
   bool SCANReplanFSM::planGlobalTrajByWaypoints(const std::vector<Eigen::Vector3d> &waypoints)
@@ -391,6 +599,7 @@ namespace scan_planner
     end_pt_ = global_data.global_traj_.evaluate(target_t);
     global_data.global_duration_ = target_t;
     global_data.last_progress_time_ = std::min(global_data.last_progress_time_, target_t);
+    updateActionExecutedGoal();
     ROS_WARN("[global target] Target [%.2f, %.2f, %.2f] is occupied; first free [%.2f, %.2f, %.2f], use %.2f m-clearance target [%.2f, %.2f, %.2f].",
              raw_end(0), raw_end(1), raw_end(2), first_free(0), first_free(1), first_free(2),
              terminal_clearance_, end_pt_(0), end_pt_(1), end_pt_(2));
@@ -680,6 +889,18 @@ namespace scan_planner
     int pre_s = int(exec_state_);
     exec_state_ = new_state;
     cout << "[" + pos_call + "]: from " + state_str[pre_s] + " to " + state_str[int(new_state)] << endl;
+
+    if (action_goal_active_ && !action_terminal_pending_)
+    {
+      if (new_state == GEN_NEW_TRAJ)
+        publishActionFeedback(scan_planner::NavigateToPoseFeedback::PLANNING, "SCAN is generating a local trajectory");
+      else if (new_state == REPLAN_TRAJ)
+        publishActionFeedback(scan_planner::NavigateToPoseFeedback::REPLANNING, "SCAN is replanning around updated obstacles");
+      else if (new_state == EXEC_TRAJ)
+        publishActionFeedback(scan_planner::NavigateToPoseFeedback::EXECUTING, "SCAN is executing the navigation goal");
+      else if (new_state == EMERGENCY_STOP)
+        publishActionFeedback(scan_planner::NavigateToPoseFeedback::STOPPING, "SCAN is performing an emergency stop");
+    }
   }
 
   std::pair<int, SCANReplanFSM::FSM_EXEC_STATE> SCANReplanFSM::timesOfConsecutiveStateCalls()
@@ -843,6 +1064,16 @@ namespace scan_planner
 
         visualization_->displayPlanningStatus(end_pt_, "GOAL REACHED", Eigen::Vector4d(0.1, 1.0, 0.2, 1.0));
 
+        if (action_goal_active_)
+        {
+          updateActionExecutedGoal();
+          queueActionTerminal(
+              action_goal_adjusted_ ? scan_planner::NavigateToPoseResult::REACHED_ADJUSTED_GOAL
+                                    : scan_planner::NavigateToPoseResult::REACHED_REQUESTED_GOAL,
+              action_goal_adjusted_ ? "SCAN reached the adjusted collision-free goal"
+                                    : "SCAN reached the requested goal");
+        }
+
         changeFSMExecState(WAIT_TARGET, "FSM");
         return;
       }
@@ -881,6 +1112,9 @@ namespace scan_planner
           have_target_ = false;
           trigger_ = false;
           changeFSMExecState(WAIT_TARGET, "EMERGENCY_EXIT");
+          finishActionTerminal();
+          if (!action_goal_active_)
+            setNavigationActive(false);
         }
       }
 
@@ -905,6 +1139,8 @@ namespace scan_planner
       replan_fail_count_ = 0;
       need_hover_stop_ = true;
       flag_escape_emergency_ = true;
+      queueActionTerminal(scan_planner::NavigateToPoseResult::ABORTED_NO_LOCAL_PATH,
+                          "SCAN exhausted local replanning and stopped safely");
       changeFSMExecState(EMERGENCY_STOP, "finishProcess");
     }
   }
