@@ -294,7 +294,6 @@ namespace scan_planner
 
     if (!startManualGoal(action_requested_goal_, true))
     {
-      updateActionExecutedGoal();
       queueActionTerminal(scan_planner::NavigateToPoseResult::REJECTED_NO_GLOBAL_PATH,
                           have_odom_ ? "SCAN could not generate a global path" : "SCAN has no odometry");
     }
