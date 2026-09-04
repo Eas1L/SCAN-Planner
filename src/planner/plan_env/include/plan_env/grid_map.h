@@ -4,6 +4,7 @@
 #include <Eigen/Eigen>
 #include <Eigen/StdVector>
 #include <algorithm>
+#include <cstdint>
 #include <cv_bridge/cv_bridge.h>
 #include <cmath>
 #include <geometry_msgs/PoseStamped.h>
@@ -80,6 +81,9 @@ struct MappingParameters {
   double prob_hit_log_, prob_miss_log_, clamp_min_log_, clamp_max_log_,
       min_occupancy_log_;                   // logit of occupancy probability
   double min_ray_length_, max_ray_length_;  // range of doing raycasting
+  bool stale_obstacle_decay_enabled_;
+  int stale_obstacle_grace_updates_;
+  double stale_obstacle_clear_radius_;
 
   /* visualization and computation time display */
   double vis_height_, ground_height_;
@@ -111,6 +115,7 @@ struct MappingData {
   std::vector<char> occupancy_buffer_inflate_;
   std::vector<int> occupancy_buffer_inflate_cnt_;
   vector<Eigen::Vector3i> inflate_offsets_;
+  vector<Eigen::Vector3i> stale_clear_offsets_;
 
   // raycast origin and sensor pose data
 
@@ -139,8 +144,9 @@ struct MappingData {
   // flag buffers for speeding up raycasting
 
   vector<short> count_hit_, count_hit_and_miss_;
-  vector<char> flag_traverse_, flag_rayend_;
-  char raycast_num_;
+  vector<std::uint32_t> flag_traverse_, flag_rayend_, flag_stale_observed_;
+  vector<std::uint32_t> last_hit_frame_;
+  std::uint32_t raycast_num_;
   queue<Eigen::Vector3i> cache_voxel_;
 
   // range of updating grid
@@ -244,6 +250,8 @@ private:
   void hashIdToGlobalIndex(int addr, Eigen::Vector3i& id_g) const;
   void applyOccupancyUpdate(const Eigen::Vector3i& id, double new_log_odds);
   void rebuildInflationOffsets();
+  void rebuildStaleClearOffsets();
+  bool decayUnsupportedObstacleNearFreeVoxel(const Eigen::Vector3i& free_id);
   void updateInflation(const Eigen::Vector3i& id, int delta, const std::vector<char>* ignore_mask = nullptr);
   void updateInflationLayer(const Eigen::Vector3i& id, int delta,
                             const vector<Eigen::Vector3i>& offsets,

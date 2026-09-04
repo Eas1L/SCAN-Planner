@@ -42,6 +42,11 @@ void GridMap::initMap(ros::NodeHandle &nh)
   node_.param("grid_map/p_max", mp_.p_max_, -1.0);
   node_.param("grid_map/p_occ", mp_.p_occ_, -1.0);
   node_.param("grid_map/max_ray_length", mp_.max_ray_length_, -0.1);
+  node_.param("grid_map/stale_obstacle_decay_enabled", mp_.stale_obstacle_decay_enabled_, false);
+  node_.param("grid_map/stale_obstacle_grace_updates", mp_.stale_obstacle_grace_updates_, 20);
+  node_.param("grid_map/stale_obstacle_clear_radius", mp_.stale_obstacle_clear_radius_, 0.08);
+  mp_.stale_obstacle_grace_updates_ = std::max(0, mp_.stale_obstacle_grace_updates_);
+  mp_.stale_obstacle_clear_radius_ = std::max(0.0, mp_.stale_obstacle_clear_radius_);
 
   node_.param("grid_map/vis_height", mp_.vis_height_, 0.3);
   node_.param("grid_map/show_occ_time", mp_.show_occ_time_, false);
@@ -117,13 +122,22 @@ void GridMap::initMap(ros::NodeHandle &nh)
   md_.occupancy_buffer_inflate_ = vector<char>(buffer_size, 0);
   md_.occupancy_buffer_inflate_cnt_ = vector<int>(buffer_size, 0);
   rebuildInflationOffsets();
+  rebuildStaleClearOffsets();
 
   md_.count_hit_and_miss_ = vector<short>(buffer_size, 0);
   md_.count_hit_ = vector<short>(buffer_size, 0);
-  md_.flag_rayend_ = vector<char>(buffer_size, -1);
-  md_.flag_traverse_ = vector<char>(buffer_size, -1);
+  md_.flag_rayend_ = vector<std::uint32_t>(buffer_size, 0);
+  md_.flag_traverse_ = vector<std::uint32_t>(buffer_size, 0);
+  md_.flag_stale_observed_ = vector<std::uint32_t>(buffer_size, 0);
+  md_.last_hit_frame_ = vector<std::uint32_t>(buffer_size, 0);
 
   md_.raycast_num_ = 0;
+
+  ROS_INFO("[GridMap] observed-free stale obstacle decay=%s, grace=%d updates, radius=%.3f m "
+           "(%zu neighbouring voxels).",
+           mp_.stale_obstacle_decay_enabled_ ? "enabled" : "disabled",
+           mp_.stale_obstacle_grace_updates_, mp_.stale_obstacle_clear_radius_,
+           md_.stale_clear_offsets_.size());
 
   md_.proj_points_.resize(640 * 480 / mp_.skip_pixel_ / mp_.skip_pixel_);
   md_.proj_points_cnt = 0;
@@ -223,6 +237,27 @@ void GridMap::rebuildInflationOffsets()
     }
 }
 
+void GridMap::rebuildStaleClearOffsets()
+{
+  md_.stale_clear_offsets_.clear();
+  if (!mp_.stale_obstacle_decay_enabled_ || mp_.stale_obstacle_clear_radius_ <= 0.0)
+    return;
+
+  const int step = static_cast<int>(std::ceil(mp_.stale_obstacle_clear_radius_ /
+                                              mp_.resolution_));
+  for (int x = -step; x <= step; ++x)
+    for (int y = -step; y <= step; ++y)
+      for (int z = -step; z <= step; ++z)
+      {
+        if (x == 0 && y == 0 && z == 0)
+          continue;
+        const Eigen::Vector3d offset =
+            Eigen::Vector3d(x, y, z) * mp_.resolution_;
+        if (offset.norm() <= mp_.stale_obstacle_clear_radius_ + 1e-9)
+          md_.stale_clear_offsets_.push_back(Eigen::Vector3i(x, y, z));
+      }
+}
+
 void GridMap::resetAllMapData()
 {
   std::fill(md_.occupancy_buffer_.begin(), md_.occupancy_buffer_.end(), mp_.clamp_min_log_ - mp_.unknown_flag_);
@@ -230,8 +265,10 @@ void GridMap::resetAllMapData()
   std::fill(md_.occupancy_buffer_inflate_cnt_.begin(), md_.occupancy_buffer_inflate_cnt_.end(), 0);
   std::fill(md_.count_hit_and_miss_.begin(), md_.count_hit_and_miss_.end(), 0);
   std::fill(md_.count_hit_.begin(), md_.count_hit_.end(), 0);
-  std::fill(md_.flag_rayend_.begin(), md_.flag_rayend_.end(), -1);
-  std::fill(md_.flag_traverse_.begin(), md_.flag_traverse_.end(), -1);
+  std::fill(md_.flag_rayend_.begin(), md_.flag_rayend_.end(), 0);
+  std::fill(md_.flag_traverse_.begin(), md_.flag_traverse_.end(), 0);
+  std::fill(md_.flag_stale_observed_.begin(), md_.flag_stale_observed_.end(), 0);
+  std::fill(md_.last_hit_frame_.begin(), md_.last_hit_frame_.end(), 0);
   std::queue<Eigen::Vector3i> empty;
   std::swap(md_.cache_voxel_, empty);
 }
@@ -307,8 +344,10 @@ void GridMap::resetCellByAddress(int addr)
   md_.occupancy_buffer_[addr] = mp_.clamp_min_log_ - mp_.unknown_flag_;
   md_.count_hit_[addr] = 0;
   md_.count_hit_and_miss_[addr] = 0;
-  md_.flag_rayend_[addr] = -1;
-  md_.flag_traverse_[addr] = -1;
+  md_.flag_rayend_[addr] = 0;
+  md_.flag_traverse_[addr] = 0;
+  md_.flag_stale_observed_[addr] = 0;
+  md_.last_hit_frame_[addr] = 0;
 }
 
 void GridMap::resetCellByAddressForSliding(int addr, const std::vector<char>& clear_mask)
@@ -408,8 +447,10 @@ void GridMap::updateSlidingMap(const Eigen::Vector3d& center)
     md_.occupancy_buffer_inflate_[addr] = 0;
     md_.count_hit_[addr] = 0;
     md_.count_hit_and_miss_[addr] = 0;
-    md_.flag_rayend_[addr] = -1;
-    md_.flag_traverse_[addr] = -1;
+    md_.flag_rayend_[addr] = 0;
+    md_.flag_traverse_[addr] = 0;
+    md_.flag_stale_observed_[addr] = 0;
+    md_.last_hit_frame_[addr] = 0;
   }
 
   mp_.map_origin_idx_ = new_origin_idx;
@@ -500,8 +541,10 @@ void GridMap::clearRobotFootprint()
         applyOccupancyUpdate(id, mp_.clamp_min_log_);
         md_.count_hit_[addr] = 0;
         md_.count_hit_and_miss_[addr] = 0;
-        md_.flag_rayend_[addr] = -1;
-        md_.flag_traverse_[addr] = -1;
+        md_.flag_rayend_[addr] = 0;
+        md_.flag_traverse_[addr] = 0;
+        md_.flag_stale_observed_[addr] = 0;
+        md_.last_hit_frame_[addr] = 0;
       }
 
   if (cleared_occupied > 0)
@@ -550,6 +593,39 @@ int GridMap::setCacheOccupancy(Eigen::Vector3d pos, int occ)
     md_.count_hit_[idx_ctns] += 1;
 
   return idx_ctns;
+}
+
+bool GridMap::decayUnsupportedObstacleNearFreeVoxel(const Eigen::Vector3i& free_id)
+{
+  if (!mp_.stale_obstacle_decay_enabled_)
+    return false;
+
+  bool requested_decay = false;
+  for (const Eigen::Vector3i& offset : md_.stale_clear_offsets_)
+  {
+    const Eigen::Vector3i candidate_id = free_id + offset;
+    if (!isInMap(candidate_id))
+      continue;
+
+    const int candidate_addr = toAddress(candidate_id);
+    if (md_.flag_stale_observed_[candidate_addr] == md_.raycast_num_)
+      continue;
+    md_.flag_stale_observed_[candidate_addr] = md_.raycast_num_;
+
+    if (md_.occupancy_buffer_[candidate_addr] <= mp_.min_occupancy_log_)
+      continue;
+
+    const std::uint32_t last_hit = md_.last_hit_frame_[candidate_addr];
+    const std::uint32_t age = md_.raycast_num_ - last_hit;
+    if (last_hit != 0 && age <= static_cast<std::uint32_t>(mp_.stale_obstacle_grace_updates_))
+      continue;
+
+    Eigen::Vector3d candidate_pos;
+    indexToPos(candidate_id, candidate_pos);
+    if (setCacheOccupancy(candidate_pos, 0) != INVALID_IDX)
+      requested_decay = true;
+  }
+  return requested_decay;
 }
 
 void GridMap::projectDepthImage()
@@ -630,7 +706,17 @@ void GridMap::raycastProcess()
 
   ros::Time t1, t2;
 
+  // The original char counter wrapped every 256 updates on AArch64 and could
+  // make current rays collide with stale per-voxel flags. uint32_t extends the
+  // period to years; clear only the frame-local flags on the eventual wrap.
   md_.raycast_num_ += 1;
+  if (md_.raycast_num_ == 0)
+  {
+    std::fill(md_.flag_rayend_.begin(), md_.flag_rayend_.end(), 0);
+    std::fill(md_.flag_traverse_.begin(), md_.flag_traverse_.end(), 0);
+    std::fill(md_.flag_stale_observed_.begin(), md_.flag_stale_observed_.end(), 0);
+    md_.raycast_num_ = 1;
+  }
 
   int vox_idx;
   double length;
@@ -647,6 +733,7 @@ void GridMap::raycastProcess()
   RayCaster raycaster;
   Eigen::Vector3d half = Eigen::Vector3d(0.5, 0.5, 0.5);
   Eigen::Vector3d ray_pt, pt_w;
+  int stale_decay_requests = 0;
 
   for (int i = 0; i < md_.proj_points_cnt; ++i)
   {
@@ -720,6 +807,10 @@ void GridMap::raycastProcess()
         else
         {
           md_.flag_traverse_[vox_idx] = md_.raycast_num_;
+          Eigen::Vector3i free_id;
+          posToIndex(tmp, free_id);
+          if (decayUnsupportedObstacleNearFreeVoxel(free_id))
+            ++stale_decay_requests;
         }
       }
     }
@@ -758,8 +849,12 @@ void GridMap::raycastProcess()
     int idx_ctns = toAddress(idx);
     md_.cache_voxel_.pop();
 
-    double log_odds_update =
-        md_.count_hit_[idx_ctns] >= md_.count_hit_and_miss_[idx_ctns] - md_.count_hit_[idx_ctns] ? mp_.prob_hit_log_ : mp_.prob_miss_log_;
+    const bool hit_update =
+        md_.count_hit_[idx_ctns] >= md_.count_hit_and_miss_[idx_ctns] - md_.count_hit_[idx_ctns];
+    double log_odds_update = hit_update ? mp_.prob_hit_log_ : mp_.prob_miss_log_;
+
+    if (hit_update)
+      md_.last_hit_frame_[idx_ctns] = md_.raycast_num_;
 
     md_.count_hit_[idx_ctns] = md_.count_hit_and_miss_[idx_ctns] = 0;
 
@@ -785,6 +880,11 @@ void GridMap::raycastProcess()
                  mp_.clamp_max_log_);
     applyOccupancyUpdate(idx, new_log_odds);
   }
+
+  if (stale_decay_requests > 0)
+    ROS_INFO_THROTTLE(2.0,
+                      "[GridMap] requested observed-free decay around %d unique ray voxels.",
+                      stale_decay_requests);
 }
 
 Eigen::Vector3d GridMap::closetPointInMap(const Eigen::Vector3d &pt, const Eigen::Vector3d &ray_pos)
