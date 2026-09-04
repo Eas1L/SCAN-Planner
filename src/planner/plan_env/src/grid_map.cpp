@@ -45,8 +45,22 @@ void GridMap::initMap(ros::NodeHandle &nh)
   node_.param("grid_map/stale_obstacle_decay_enabled", mp_.stale_obstacle_decay_enabled_, false);
   node_.param("grid_map/stale_obstacle_grace_updates", mp_.stale_obstacle_grace_updates_, 20);
   node_.param("grid_map/stale_obstacle_clear_radius", mp_.stale_obstacle_clear_radius_, 0.08);
+  node_.param("grid_map/transient_obstacle_decay_enabled",
+              mp_.transient_obstacle_decay_enabled_, false);
+  node_.param("grid_map/transient_obstacle_stable_frames",
+              mp_.transient_obstacle_stable_frames_, 5);
+  node_.param("grid_map/transient_obstacle_missing_frames",
+              mp_.transient_obstacle_missing_frames_, 5);
+  node_.param("grid_map/transient_obstacle_support_radius",
+              mp_.transient_obstacle_support_radius_, 0.10);
   mp_.stale_obstacle_grace_updates_ = std::max(0, mp_.stale_obstacle_grace_updates_);
   mp_.stale_obstacle_clear_radius_ = std::max(0.0, mp_.stale_obstacle_clear_radius_);
+  mp_.transient_obstacle_stable_frames_ =
+      std::max(1, std::min(255, mp_.transient_obstacle_stable_frames_));
+  mp_.transient_obstacle_missing_frames_ =
+      std::max(1, std::min(255, mp_.transient_obstacle_missing_frames_));
+  mp_.transient_obstacle_support_radius_ =
+      std::max(0.0, mp_.transient_obstacle_support_radius_);
 
   node_.param("grid_map/vis_height", mp_.vis_height_, 0.3);
   node_.param("grid_map/show_occ_time", mp_.show_occ_time_, false);
@@ -123,6 +137,7 @@ void GridMap::initMap(ros::NodeHandle &nh)
   md_.occupancy_buffer_inflate_cnt_ = vector<int>(buffer_size, 0);
   rebuildInflationOffsets();
   rebuildStaleClearOffsets();
+  rebuildEndpointSupportOffsets();
 
   md_.count_hit_and_miss_ = vector<short>(buffer_size, 0);
   md_.count_hit_ = vector<short>(buffer_size, 0);
@@ -130,6 +145,13 @@ void GridMap::initMap(ros::NodeHandle &nh)
   md_.flag_traverse_ = vector<std::uint32_t>(buffer_size, 0);
   md_.flag_stale_observed_ = vector<std::uint32_t>(buffer_size, 0);
   md_.last_hit_frame_ = vector<std::uint32_t>(buffer_size, 0);
+  if (mp_.transient_obstacle_decay_enabled_)
+  {
+    md_.flag_endpoint_supported_ = vector<std::uint32_t>(buffer_size, 0);
+    md_.obstacle_supported_streak_ = vector<std::uint8_t>(buffer_size, 0);
+    md_.obstacle_missing_streak_ = vector<std::uint8_t>(buffer_size, 0);
+    md_.obstacle_stable_ = vector<std::uint8_t>(buffer_size, 0);
+  }
 
   md_.raycast_num_ = 0;
 
@@ -138,6 +160,11 @@ void GridMap::initMap(ros::NodeHandle &nh)
            mp_.stale_obstacle_decay_enabled_ ? "enabled" : "disabled",
            mp_.stale_obstacle_grace_updates_, mp_.stale_obstacle_clear_radius_,
            md_.stale_clear_offsets_.size());
+  ROS_INFO("[GridMap] transient obstacle support decay=%s, stable=%d frames, missing=%d "
+           "frames, support radius=%.3f m (%zu voxels).",
+           mp_.transient_obstacle_decay_enabled_ ? "enabled" : "disabled",
+           mp_.transient_obstacle_stable_frames_, mp_.transient_obstacle_missing_frames_,
+           mp_.transient_obstacle_support_radius_, md_.endpoint_support_offsets_.size());
 
   md_.proj_points_.resize(640 * 480 / mp_.skip_pixel_ / mp_.skip_pixel_);
   md_.proj_points_cnt = 0;
@@ -258,6 +285,24 @@ void GridMap::rebuildStaleClearOffsets()
       }
 }
 
+void GridMap::rebuildEndpointSupportOffsets()
+{
+  md_.endpoint_support_offsets_.clear();
+  if (!mp_.transient_obstacle_decay_enabled_)
+    return;
+
+  const int step = static_cast<int>(std::ceil(mp_.transient_obstacle_support_radius_ /
+                                              mp_.resolution_));
+  for (int x = -step; x <= step; ++x)
+    for (int y = -step; y <= step; ++y)
+      for (int z = -step; z <= step; ++z)
+      {
+        const Eigen::Vector3d offset = Eigen::Vector3d(x, y, z) * mp_.resolution_;
+        if (offset.norm() <= mp_.transient_obstacle_support_radius_ + 1e-9)
+          md_.endpoint_support_offsets_.push_back(Eigen::Vector3i(x, y, z));
+      }
+}
+
 void GridMap::resetAllMapData()
 {
   std::fill(md_.occupancy_buffer_.begin(), md_.occupancy_buffer_.end(), mp_.clamp_min_log_ - mp_.unknown_flag_);
@@ -269,6 +314,14 @@ void GridMap::resetAllMapData()
   std::fill(md_.flag_traverse_.begin(), md_.flag_traverse_.end(), 0);
   std::fill(md_.flag_stale_observed_.begin(), md_.flag_stale_observed_.end(), 0);
   std::fill(md_.last_hit_frame_.begin(), md_.last_hit_frame_.end(), 0);
+  if (mp_.transient_obstacle_decay_enabled_)
+  {
+    std::fill(md_.flag_endpoint_supported_.begin(), md_.flag_endpoint_supported_.end(), 0);
+    std::fill(md_.obstacle_supported_streak_.begin(), md_.obstacle_supported_streak_.end(), 0);
+    std::fill(md_.obstacle_missing_streak_.begin(), md_.obstacle_missing_streak_.end(), 0);
+    std::fill(md_.obstacle_stable_.begin(), md_.obstacle_stable_.end(), 0);
+    md_.tracked_occupied_voxels_.clear();
+  }
   std::queue<Eigen::Vector3i> empty;
   std::swap(md_.cache_voxel_, empty);
 }
@@ -331,7 +384,34 @@ void GridMap::applyOccupancyUpdate(const Eigen::Vector3i& id, double new_log_odd
 
   md_.occupancy_buffer_[addr] = new_log_odds;
   if (was_occ != now_occ)
+  {
     updateInflation(id, now_occ ? 1 : -1);
+    if (mp_.transient_obstacle_decay_enabled_)
+    {
+      if (now_occ)
+      {
+        md_.tracked_occupied_voxels_.insert(addr);
+        md_.obstacle_supported_streak_[addr] = 0;
+        md_.obstacle_missing_streak_[addr] = 0;
+        md_.obstacle_stable_[addr] = 0;
+      }
+      else
+      {
+        resetTransientObstacleState(addr);
+      }
+    }
+  }
+}
+
+void GridMap::resetTransientObstacleState(int addr)
+{
+  if (!mp_.transient_obstacle_decay_enabled_)
+    return;
+  md_.tracked_occupied_voxels_.erase(addr);
+  md_.flag_endpoint_supported_[addr] = 0;
+  md_.obstacle_supported_streak_[addr] = 0;
+  md_.obstacle_missing_streak_[addr] = 0;
+  md_.obstacle_stable_[addr] = 0;
 }
 
 void GridMap::resetCellByAddress(int addr)
@@ -348,6 +428,7 @@ void GridMap::resetCellByAddress(int addr)
   md_.flag_traverse_[addr] = 0;
   md_.flag_stale_observed_[addr] = 0;
   md_.last_hit_frame_[addr] = 0;
+  resetTransientObstacleState(addr);
 }
 
 void GridMap::resetCellByAddressForSliding(int addr, const std::vector<char>& clear_mask)
@@ -451,6 +532,7 @@ void GridMap::updateSlidingMap(const Eigen::Vector3d& center)
     md_.flag_traverse_[addr] = 0;
     md_.flag_stale_observed_[addr] = 0;
     md_.last_hit_frame_[addr] = 0;
+    resetTransientObstacleState(addr);
   }
 
   mp_.map_origin_idx_ = new_origin_idx;
@@ -545,6 +627,7 @@ void GridMap::clearRobotFootprint()
         md_.flag_traverse_[addr] = 0;
         md_.flag_stale_observed_[addr] = 0;
         md_.last_hit_frame_[addr] = 0;
+        resetTransientObstacleState(addr);
       }
 
   if (cleared_occupied > 0)
@@ -626,6 +709,97 @@ bool GridMap::decayUnsupportedObstacleNearFreeVoxel(const Eigen::Vector3i& free_
       requested_decay = true;
   }
   return requested_decay;
+}
+
+void GridMap::markEndpointSupport(const Eigen::Vector3d& endpoint)
+{
+  if (!mp_.transient_obstacle_decay_enabled_)
+    return;
+
+  Eigen::Vector3i endpoint_id;
+  posToIndex(endpoint, endpoint_id);
+  for (const Eigen::Vector3i& offset : md_.endpoint_support_offsets_)
+  {
+    const Eigen::Vector3i supported_id = endpoint_id + offset;
+    if (!isInMap(supported_id))
+      continue;
+    md_.flag_endpoint_supported_[toAddress(supported_id)] = md_.raycast_num_;
+  }
+}
+
+void GridMap::updateTransientObstacleStates()
+{
+  if (!mp_.transient_obstacle_decay_enabled_)
+    return;
+
+  // applyOccupancyUpdate removes cleared addresses from the live set. Iterate
+  // over a snapshot so those erases cannot invalidate this pass.
+  const std::vector<int> tracked(md_.tracked_occupied_voxels_.begin(),
+                                 md_.tracked_occupied_voxels_.end());
+  int temporary_count = 0;
+  int stable_count = 0;
+  int unsupported_temporary_count = 0;
+  int promoted_count = 0;
+  int decay_update_count = 0;
+  int cleared_count = 0;
+
+  for (const int addr : tracked)
+  {
+    if (md_.occupancy_buffer_[addr] <= mp_.min_occupancy_log_)
+    {
+      resetTransientObstacleState(addr);
+      continue;
+    }
+
+    const bool supported = md_.flag_endpoint_supported_[addr] == md_.raycast_num_;
+    if (md_.obstacle_stable_[addr] != 0)
+    {
+      ++stable_count;
+      if (supported)
+        md_.obstacle_missing_streak_[addr] = 0;
+      continue;
+    }
+
+    ++temporary_count;
+    if (supported)
+    {
+      md_.obstacle_missing_streak_[addr] = 0;
+      if (md_.obstacle_supported_streak_[addr] < 255)
+        ++md_.obstacle_supported_streak_[addr];
+      if (md_.obstacle_supported_streak_[addr] >= mp_.transient_obstacle_stable_frames_)
+      {
+        md_.obstacle_stable_[addr] = 1;
+        ++promoted_count;
+        --temporary_count;
+        ++stable_count;
+      }
+      continue;
+    }
+
+    ++unsupported_temporary_count;
+    md_.obstacle_supported_streak_[addr] = 0;
+    if (md_.obstacle_missing_streak_[addr] < 255)
+      ++md_.obstacle_missing_streak_[addr];
+    if (md_.obstacle_missing_streak_[addr] < mp_.transient_obstacle_missing_frames_)
+      continue;
+
+    Eigen::Vector3i id;
+    hashIdToGlobalIndex(addr, id);
+    const double new_log_odds =
+        std::max(md_.occupancy_buffer_[addr] + mp_.prob_miss_log_, mp_.clamp_min_log_);
+    const bool was_occupied = md_.occupancy_buffer_[addr] > mp_.min_occupancy_log_;
+    applyOccupancyUpdate(id, new_log_odds);
+    ++decay_update_count;
+    if (was_occupied && new_log_odds <= mp_.min_occupancy_log_)
+      ++cleared_count;
+  }
+
+  ROS_INFO_THROTTLE(2.0,
+                    "[GridMap] obstacle support: tracked=%zu temporary=%d stable=%d "
+                    "unsupported_temporary=%d promoted=%d decay_updates=%d cleared=%d.",
+                    md_.tracked_occupied_voxels_.size(), temporary_count, stable_count,
+                    unsupported_temporary_count, promoted_count, decay_update_count,
+                    cleared_count);
 }
 
 void GridMap::projectDepthImage()
@@ -715,6 +889,8 @@ void GridMap::raycastProcess()
     std::fill(md_.flag_rayend_.begin(), md_.flag_rayend_.end(), 0);
     std::fill(md_.flag_traverse_.begin(), md_.flag_traverse_.end(), 0);
     std::fill(md_.flag_stale_observed_.begin(), md_.flag_stale_observed_.end(), 0);
+    if (mp_.transient_obstacle_decay_enabled_)
+      std::fill(md_.flag_endpoint_supported_.begin(), md_.flag_endpoint_supported_.end(), 0);
     md_.raycast_num_ = 1;
   }
 
@@ -738,6 +914,7 @@ void GridMap::raycastProcess()
   for (int i = 0; i < md_.proj_points_cnt; ++i)
   {
     pt_w = md_.proj_points_[i];
+    bool endpoint_is_hit = false;
 
     // set flag for projected point
 
@@ -764,8 +941,12 @@ void GridMap::raycastProcess()
       else
       {
         vox_idx = setCacheOccupancy(pt_w, 1);
+        endpoint_is_hit = true;
       }
     }
+
+    if (endpoint_is_hit)
+      markEndpointSupport(pt_w);
 
     max_x = max(max_x, pt_w(0));
     max_y = max(max_y, pt_w(1));
@@ -880,6 +1061,8 @@ void GridMap::raycastProcess()
                  mp_.clamp_max_log_);
     applyOccupancyUpdate(idx, new_log_odds);
   }
+
+  updateTransientObstacleStates();
 
   if (stale_decay_requests > 0)
     ROS_INFO_THROTTLE(2.0,

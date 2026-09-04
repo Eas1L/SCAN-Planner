@@ -15,6 +15,7 @@
 #include <queue>
 #include <ros/ros.h>
 #include <tuple>
+#include <unordered_set>
 #include <visualization_msgs/Marker.h>
 
 #include <pcl/point_cloud.h>
@@ -84,6 +85,10 @@ struct MappingParameters {
   bool stale_obstacle_decay_enabled_;
   int stale_obstacle_grace_updates_;
   double stale_obstacle_clear_radius_;
+  bool transient_obstacle_decay_enabled_;
+  int transient_obstacle_stable_frames_;
+  int transient_obstacle_missing_frames_;
+  double transient_obstacle_support_radius_;
 
   /* visualization and computation time display */
   double vis_height_, ground_height_;
@@ -116,6 +121,7 @@ struct MappingData {
   std::vector<int> occupancy_buffer_inflate_cnt_;
   vector<Eigen::Vector3i> inflate_offsets_;
   vector<Eigen::Vector3i> stale_clear_offsets_;
+  vector<Eigen::Vector3i> endpoint_support_offsets_;
 
   // raycast origin and sensor pose data
 
@@ -144,8 +150,12 @@ struct MappingData {
   // flag buffers for speeding up raycasting
 
   vector<short> count_hit_, count_hit_and_miss_;
-  vector<std::uint32_t> flag_traverse_, flag_rayend_, flag_stale_observed_;
+  vector<std::uint32_t> flag_traverse_, flag_rayend_, flag_stale_observed_,
+      flag_endpoint_supported_;
   vector<std::uint32_t> last_hit_frame_;
+  vector<std::uint8_t> obstacle_supported_streak_, obstacle_missing_streak_,
+      obstacle_stable_;
+  std::unordered_set<int> tracked_occupied_voxels_;
   std::uint32_t raycast_num_;
   queue<Eigen::Vector3i> cache_voxel_;
 
@@ -251,7 +261,11 @@ private:
   void applyOccupancyUpdate(const Eigen::Vector3i& id, double new_log_odds);
   void rebuildInflationOffsets();
   void rebuildStaleClearOffsets();
+  void rebuildEndpointSupportOffsets();
   bool decayUnsupportedObstacleNearFreeVoxel(const Eigen::Vector3i& free_id);
+  void markEndpointSupport(const Eigen::Vector3d& endpoint);
+  void updateTransientObstacleStates();
+  void resetTransientObstacleState(int addr);
   void updateInflation(const Eigen::Vector3i& id, int delta, const std::vector<char>* ignore_mask = nullptr);
   void updateInflationLayer(const Eigen::Vector3i& id, int delta,
                             const vector<Eigen::Vector3i>& offsets,
