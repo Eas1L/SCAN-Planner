@@ -50,6 +50,7 @@ generate_messages(
   actionlib_msgs
   std_msgs
   geometry_msgs
+  nav_msgs
 )
 
 # catkin_package(CATKIN_DEPENDS message_runtime)

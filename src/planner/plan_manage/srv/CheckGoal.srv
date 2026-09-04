@@ -3,3 +3,4 @@ geometry_msgs/PoseStamped goal
 bool success
 string message
 geometry_msgs/PoseStamped planned_goal
+nav_msgs/Path planned_path

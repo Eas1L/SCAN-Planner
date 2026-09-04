@@ -712,6 +712,7 @@ namespace scan_planner
   {
     response.planned_goal = request.goal;
     response.planned_goal.header.stamp = ros::Time::now();
+    response.planned_path.header = response.planned_goal.header;
 
     if (navi_mode_ != NAVI_MODE::MANUAL_TARGET)
     {
@@ -781,6 +782,32 @@ namespace scan_planner
     }
 
     const Eigen::Vector3d planned_end = end_pt_;
+    if (success)
+    {
+      const double duration = planner_manager_->global_data_.global_duration_;
+      const int sample_count = std::max(2, static_cast<int>(std::ceil(duration / 0.10)) + 1);
+      response.planned_path.poses.reserve(sample_count);
+      for (int index = 0; index < sample_count; ++index)
+      {
+        const double ratio = static_cast<double>(index) /
+                             static_cast<double>(sample_count - 1);
+        const double sample_time = duration * ratio;
+        const Eigen::Vector3d point = planner_manager_->global_data_.getPosition(sample_time);
+        geometry_msgs::PoseStamped pose;
+        pose.header = response.planned_path.header;
+        pose.pose.position.x = point(0);
+        pose.pose.position.y = point(1);
+        pose.pose.position.z = point(2);
+        pose.pose.orientation = request.goal.pose.orientation;
+        response.planned_path.poses.push_back(pose);
+      }
+      response.planned_path.poses.front().pose.position.x = odom_pos_(0);
+      response.planned_path.poses.front().pose.position.y = odom_pos_(1);
+      response.planned_path.poses.front().pose.position.z = odom_pos_(2);
+      response.planned_path.poses.back().pose.position.x = planned_end(0);
+      response.planned_path.poses.back().pose.position.y = planned_end(1);
+      response.planned_path.poses.back().pose.position.z = planned_end(2);
+    }
     planner_manager_->global_data_ = global_backup;
     planner_manager_->local_data_ = local_backup;
     planner_manager_->restoreContinuousFailuresCount(failure_count_backup);
@@ -797,9 +824,10 @@ namespace scan_planner
     response.planned_goal.pose.position.x = planned_end(0);
     response.planned_goal.pose.position.y = planned_end(1);
     response.planned_goal.pose.position.z = planned_end(2);
-    ROS_INFO("[goal check] candidate [%.2f, %.2f] -> %s: %s",
+    ROS_INFO("[goal check] candidate [%.2f, %.2f] -> %s: %s; path_points=%zu",
              request.goal.pose.position.x, request.goal.pose.position.y,
-             success ? "accepted" : "rejected", message.c_str());
+             success ? "accepted" : "rejected", message.c_str(),
+             response.planned_path.poses.size());
     return true;
   }
 
