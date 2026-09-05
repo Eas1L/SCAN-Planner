@@ -1,6 +1,6 @@
 # SCAN-Planner `3d_real_dog` 分支计划与进展
 
-本文件只记录 SCAN-Planner 在 Unitree Go2 三维实机方法中的规划、占据地图和轨迹执行适配。整套传感器与 AgenticNav 启动方式见外层 `AgenticNavWorkSpace` 的同名分支。
+本文件只记录 SCAN-Planner 在 Unitree Go2 三维实机方法中的规划、占据地图和轨迹执行适配。整套传感器与 AgenticNav 启动方式见本地主机外层目录`3DAgenticNavWorkSpace`的同名分支；上游仓库名称仍为AgenticNavWorkSpace。
 
 ## 分支边界
 
