@@ -1,5 +1,12 @@
 # SCAN-Planner `3d_real_dog` 分支计划与进展
 
+## 2026-09-07 GitHub 同步核验
+
+- 此前仅存在于本地主机的八个提交已经全部推送到 GitHub 的
+  `3d_real_dog` 分支，其中包括临时与稳定障碍分层修复和长时静止验收记录。
+- 本地分支、远端分支和外层工作区登记的 SCAN Planner 版本现已一致。
+- 本地主机的外层子模块登记已经修复，递归子模块状态检查可正常识别本仓库。
+
 本文件只记录 SCAN-Planner 在 Unitree Go2 三维实机方法中的规划、占据地图和轨迹执行适配。整套传感器与 AgenticNav 启动方式见本地主机外层目录`3DAgenticNavWorkSpace`的同名分支；上游仓库名称仍为AgenticNavWorkSpace。
 
 ## 分支边界
