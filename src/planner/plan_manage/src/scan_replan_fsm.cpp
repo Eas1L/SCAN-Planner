@@ -1280,6 +1280,11 @@ namespace scan_planner
     if (detour_distance)
       *detour_distance = extra;
 
+    bool safe_mode = false;
+    ros::param::param<bool>("/agenticnav/safe_mode", safe_mode, false);
+    if (!safe_mode)
+      return true;
+
     const bool ratio_exceeded =
         max_local_detour_ratio_ > 0.0 && ratio > max_local_detour_ratio_;
     const bool distance_exceeded =
