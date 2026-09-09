@@ -2,6 +2,8 @@
 #include <plan_manage/scan_replan_fsm.h>
 #include <cmath>
 #include <cstdlib>
+#include <iomanip>
+#include <sstream>
 
 namespace
 {
@@ -36,6 +38,8 @@ namespace scan_planner
     flag_escape_emergency_ = true;
     need_hover_stop_ = false;
     replan_fail_count_ = 0;
+    local_detour_limit_exceeded_ = false;
+    local_detour_rejection_message_.clear();
     last_freeze_update_time_ = ros::Time::now();
     action_goal_active_ = false;
     action_goal_adjusted_ = false;
@@ -58,6 +62,10 @@ namespace scan_planner
     nh.param("fsm/max_replan_fail_count", max_replan_fail_count_, 1000);
     nh.param("fsm/terminal_clearance", terminal_clearance_, 0.25);
     terminal_clearance_ = std::max(0.0, terminal_clearance_);
+    nh.param("fsm/max_local_detour_ratio", max_local_detour_ratio_, 0.0);
+    nh.param("fsm/max_local_detour_m", max_local_detour_m_, 0.0);
+    max_local_detour_ratio_ = std::max(0.0, max_local_detour_ratio_);
+    max_local_detour_m_ = std::max(0.0, max_local_detour_m_);
     nh.param("grid_map/obstacles_inflation_z_up", self_inflation_z_up_, 0.0);
     nh.param("grid_map/obstacles_inflation_z_down", self_inflation_z_down_, 0.0);
     nh.param("grid_map/double_cylinder_radius", self_double_cylinder_radius_, 0.0);
@@ -782,17 +790,58 @@ namespace scan_planner
     }
 
     const Eigen::Vector3d planned_end = end_pt_;
+    std::vector<Eigen::Vector3d> checked_local_path;
     if (success)
     {
-      const double duration = planner_manager_->global_data_.global_duration_;
-      const int sample_count = std::max(2, static_cast<int>(std::ceil(duration / 0.10)) + 1);
-      response.planned_path.poses.reserve(sample_count);
-      for (int index = 0; index < sample_count; ++index)
+      checked_local_path = sampleLocalTrajectory();
+      if (checked_local_path.size() < 2)
       {
-        const double ratio = static_cast<double>(index) /
-                             static_cast<double>(sample_count - 1);
-        const double sample_time = duration * ratio;
-        const Eigen::Vector3d point = planner_manager_->global_data_.getPosition(sample_time);
+        success = false;
+        message = "SCAN-Planner generated an empty local trajectory";
+      }
+      else
+      {
+        const double endpoint_error =
+            (checked_local_path.back().head<2>() - planned_end.head<2>()).norm();
+        if (endpoint_error > 0.15)
+        {
+          success = false;
+          std::ostringstream stream;
+          stream << std::fixed << std::setprecision(2)
+                 << "SCAN-Planner local trajectory stops " << endpoint_error
+                 << "m before the requested current-step goal";
+          message = stream.str();
+        }
+        else
+        {
+          double path_distance = 0.0;
+          double direct_distance = 0.0;
+          double detour_ratio = 0.0;
+          double detour_distance = 0.0;
+          if (!localTrajectoryDetourAcceptable(
+                  message, &path_distance, &direct_distance,
+                  &detour_ratio, &detour_distance))
+          {
+            success = false;
+          }
+          else
+          {
+            std::ostringstream stream;
+            stream << std::fixed << std::setprecision(2)
+                   << "SCAN-Planner found a collision-free local trajectory: path="
+                   << path_distance << "m, direct=" << direct_distance
+                   << "m, ratio=" << detour_ratio << ", extra="
+                   << detour_distance << "m";
+            message = stream.str();
+          }
+        }
+      }
+    }
+    if (success)
+    {
+      response.planned_path.poses.reserve(checked_local_path.size());
+      for (const Eigen::Vector3d &point : checked_local_path)
+      {
         geometry_msgs::PoseStamped pose;
         pose.header = response.planned_path.header;
         pose.pose.position.x = point(0);
@@ -1010,6 +1059,11 @@ namespace scan_planner
       }
       else
       {
+        if (local_detour_limit_exceeded_)
+        {
+          abortForExcessiveDetour("INITIAL_PLAN_DETOUR");
+          break;
+        }
         replan_fail_count_++;
         if (replan_fail_count_ == 1 || replan_fail_count_ % 50 == 0)
         {
@@ -1033,6 +1087,11 @@ namespace scan_planner
       }
       else
       {
+        if (local_detour_limit_exceeded_)
+        {
+          abortForExcessiveDetour("RUNTIME_REPLAN_DETOUR");
+          break;
+        }
         replan_fail_count_++;
         changeFSMExecState(REPLAN_TRAJ, "FSM");
       }
@@ -1172,6 +1231,90 @@ namespace scan_planner
     }
   }
 
+  std::vector<Eigen::Vector3d> SCANReplanFSM::sampleLocalTrajectory(double sample_period_s)
+  {
+    std::vector<Eigen::Vector3d> points;
+    LocalTrajData &info = planner_manager_->local_data_;
+    if (info.duration_ <= 1e-6)
+      return points;
+
+    const double period = std::max(0.01, sample_period_s);
+    const int sample_count = std::max(
+        2, static_cast<int>(std::ceil(info.duration_ / period)) + 1);
+    points.reserve(sample_count);
+    for (int index = 0; index < sample_count; ++index)
+    {
+      const double ratio = static_cast<double>(index) /
+                           static_cast<double>(sample_count - 1);
+      points.push_back(info.position_traj_.evaluateDeBoorT(info.duration_ * ratio));
+    }
+    return points;
+  }
+
+  bool SCANReplanFSM::localTrajectoryDetourAcceptable(
+      std::string &message,
+      double *path_distance,
+      double *direct_distance,
+      double *detour_ratio,
+      double *detour_distance)
+  {
+    const std::vector<Eigen::Vector3d> points = sampleLocalTrajectory();
+    if (points.size() < 2)
+    {
+      message = "SCAN-Planner generated an empty local trajectory";
+      return false;
+    }
+
+    double path = 0.0;
+    for (size_t index = 1; index < points.size(); ++index)
+      path += (points[index].head<2>() - points[index - 1].head<2>()).norm();
+    const double direct = (points.back().head<2>() - points.front().head<2>()).norm();
+    const double ratio = path / std::max(direct, 1e-3);
+    const double extra = path - direct;
+    if (path_distance)
+      *path_distance = path;
+    if (direct_distance)
+      *direct_distance = direct;
+    if (detour_ratio)
+      *detour_ratio = ratio;
+    if (detour_distance)
+      *detour_distance = extra;
+
+    const bool ratio_exceeded =
+        max_local_detour_ratio_ > 0.0 && ratio > max_local_detour_ratio_;
+    const bool distance_exceeded =
+        max_local_detour_m_ > 0.0 && extra > max_local_detour_m_;
+    if (!ratio_exceeded && !distance_exceeded)
+      return true;
+
+    std::ostringstream stream;
+    stream << std::fixed << std::setprecision(2)
+           << "SCAN rejected excessive local detour before execution: path="
+           << path << "m, direct=" << direct << "m, ratio=" << ratio
+           << " (max " << max_local_detour_ratio_ << "), extra=" << extra
+           << "m (max " << max_local_detour_m_ << "m)";
+    message = stream.str();
+    return false;
+  }
+
+  void SCANReplanFSM::abortForExcessiveDetour(const std::string &source)
+  {
+    const std::string message = local_detour_rejection_message_.empty()
+                                    ? "SCAN rejected an excessive local detour before execution"
+                                    : local_detour_rejection_message_;
+    ROS_WARN("[%s] %s", source.c_str(), message.c_str());
+    visualization_->displayGoalPoint(end_pt_, Eigen::Vector4d(1.0, 0.1, 0.1, 1.0), 0.3, 0);
+    visualization_->displayPlanningStatus(
+        end_pt_, "PLAN REJECTED: EXCESSIVE DETOUR",
+        Eigen::Vector4d(1.0, 0.1, 0.1, 1.0));
+    replan_fail_count_ = 0;
+    need_hover_stop_ = true;
+    flag_escape_emergency_ = true;
+    queueActionTerminal(scan_planner::NavigateToPoseResult::ABORTED_NO_LOCAL_PATH,
+                        message);
+    changeFSMExecState(EMERGENCY_STOP, source);
+  }
+
   bool SCANReplanFSM::planFromCurrentTraj()
   {
     LocalTrajData *info = &planner_manager_->local_data_;
@@ -1190,9 +1333,13 @@ namespace scan_planner
       bool success = callReboundReplan(false, false);
       if (!success)
       {
+        if (local_detour_limit_exceeded_)
+          return false;
         success = callReboundReplan(true, false);
         if (!success)
         {
+          if (local_detour_limit_exceeded_)
+            return false;
           success = callReboundReplan(true, true);
           if (!success)
             return false;
@@ -1231,6 +1378,8 @@ namespace scan_planner
     bool success = callReboundReplan(true, false);
     if (!success)
     {
+      if (local_detour_limit_exceeded_)
+        return false;
       success = callReboundReplan(true, true);
       if (!success)
         return false;
@@ -1295,6 +1444,11 @@ namespace scan_planner
         }
         else
         {
+          if (local_detour_limit_exceeded_)
+          {
+            abortForExcessiveDetour("SAFETY_DETOUR");
+            return;
+          }
           if (t - t_cur < emergency_time_) // 0.8s of emergency time
           {
             ROS_WARN("Suddenly discovered obstacles. emergency stop! time=%f", t - t_cur);
@@ -1315,6 +1469,9 @@ namespace scan_planner
   bool SCANReplanFSM::callReboundReplan(bool flag_use_poly_init, bool flag_randomPolyTraj)
   {
 
+    local_detour_limit_exceeded_ = false;
+    local_detour_rejection_message_.clear();
+
     getLocalTarget();
 
     bool plan_success =
@@ -1325,6 +1482,12 @@ namespace scan_planner
 
     if (plan_success)
     {
+
+      if (!localTrajectoryDetourAcceptable(local_detour_rejection_message_))
+      {
+        local_detour_limit_exceeded_ = true;
+        return false;
+      }
 
       auto info = &planner_manager_->local_data_;
 

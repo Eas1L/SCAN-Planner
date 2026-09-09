@@ -64,6 +64,8 @@ namespace scan_planner
     double planning_horizon_;
     double emergency_time_;
     double terminal_clearance_;
+    double max_local_detour_ratio_;
+    double max_local_detour_m_;
     double rviz_goal_height_;
     double self_inflation_z_up_, self_inflation_z_down_;
     double self_double_cylinder_radius_, self_double_cylinder_offset_;
@@ -79,6 +81,8 @@ namespace scan_planner
     int continuously_called_times_{0};
     int replan_fail_count_{0};
     int max_replan_fail_count_{1000};
+    bool local_detour_limit_exceeded_{false};
+    std::string local_detour_rejection_message_;
     ros::Time last_freeze_update_time_;
 
     Eigen::Vector3d odom_pos_, odom_vel_, odom_acc_; // odometry state
@@ -119,6 +123,13 @@ namespace scan_planner
     bool callEmergencyStop(Eigen::Vector3d stop_pos);                          // front-end and back-end method
     bool planFromCurrentTraj();
     void setStartStateFromOdomOrCurrentTraj();
+    std::vector<Eigen::Vector3d> sampleLocalTrajectory(double sample_period_s = 0.05);
+    bool localTrajectoryDetourAcceptable(std::string &message,
+                                         double *path_distance = nullptr,
+                                         double *direct_distance = nullptr,
+                                         double *detour_ratio = nullptr,
+                                         double *detour_distance = nullptr);
+    void abortForExcessiveDetour(const std::string &source);
 
     /* return value: std::pair< Times of the same state be continuously called, current continuously called state > */
     void changeFSMExecState(FSM_EXEC_STATE new_state, string pos_call);
