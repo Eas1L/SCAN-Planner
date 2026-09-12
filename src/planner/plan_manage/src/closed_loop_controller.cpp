@@ -101,16 +101,18 @@ Eigen::Vector2d clampNorm(const Eigen::Vector2d &value, double max_norm)
 
 double estimateDesiredYaw(double t_cur, const Eigen::Vector3d &pos_des)
 {
+  constexpr double kMinLookaheadDisplacementSq = 0.01 * 0.01;
+  constexpr double kMinDirectionSpeedSq = 0.03 * 0.03;
   const double t_look = std::min(traj_duration, t_cur + time_forward);
   Eigen::Vector3d dir = traj[0].evaluateDeBoorT(t_look) - pos_des;
 
-  if (dir.head<2>().squaredNorm() < 1e-4)
+  if (dir.head<2>().squaredNorm() < kMinLookaheadDisplacementSq)
   {
     Eigen::Vector3d vel = traj[1].evaluateDeBoorT(t_cur);
     dir = vel;
   }
 
-  if (dir.head<2>().squaredNorm() < 1e-4)
+  if (dir.head<2>().squaredNorm() < kMinDirectionSpeedSq)
     return odom_yaw;
 
   return std::atan2(dir(1), dir(0));
