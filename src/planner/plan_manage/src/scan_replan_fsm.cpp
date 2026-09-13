@@ -64,6 +64,7 @@ namespace scan_planner
     terminal_clearance_ = std::max(0.0, terminal_clearance_);
     nh.param("fsm/max_local_detour_ratio", max_local_detour_ratio_, 0.0);
     nh.param("fsm/max_local_detour_m", max_local_detour_m_, 0.0);
+    nh.param("fsm/manual_goal_use_requested_height", manual_goal_use_requested_height_, false);
     max_local_detour_ratio_ = std::max(0.0, max_local_detour_ratio_);
     max_local_detour_m_ = std::max(0.0, max_local_detour_m_);
     nh.param("grid_map/obstacles_inflation_z_up", self_inflation_z_up_, 0.0);
@@ -384,7 +385,7 @@ namespace scan_planner
       return false;
     }
 
-    if (msg->poses[0].pose.position.z < -1.0)
+    if (!manual_goal_use_requested_height_ && msg->poses[0].pose.position.z < -1.0)
       return false;
 
     cout << "Triggered!" << endl;
@@ -392,7 +393,11 @@ namespace scan_planner
     init_pt_ = odom_pos_;
 
     bool success = false;
-    end_pt_ << msg->poses[0].pose.position.x, msg->poses[0].pose.position.y, rviz_goal_height_;
+    end_pt_ << msg->poses[0].pose.position.x,
+        msg->poses[0].pose.position.y,
+        manual_goal_use_requested_height_
+            ? msg->poses[0].pose.position.z
+            : rviz_goal_height_;
     visualization_->clearCurrentPlan();
     visualization_->displayGoalPoint(end_pt_, Eigen::Vector4d(1.0, 0.8, 0.0, 1.0), 0.3, 0);
     visualization_->displayPlanningStatus(end_pt_, "GOAL RECEIVED - PLANNING", Eigen::Vector4d(1.0, 0.8, 0.0, 1.0));
@@ -753,7 +758,9 @@ namespace scan_planner
 
     end_pt_ << request.goal.pose.position.x,
         request.goal.pose.position.y,
-        rviz_goal_height_;
+        manual_goal_use_requested_height_
+            ? request.goal.pose.position.z
+            : rviz_goal_height_;
     start_pt_ = odom_pos_;
     start_vel_ = odom_vel_;
     start_acc_.setZero();

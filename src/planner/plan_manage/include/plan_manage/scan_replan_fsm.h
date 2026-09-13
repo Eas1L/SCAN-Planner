@@ -67,6 +67,7 @@ namespace scan_planner
     double max_local_detour_ratio_;
     double max_local_detour_m_;
     double rviz_goal_height_;
+    bool manual_goal_use_requested_height_;
     double self_inflation_z_up_, self_inflation_z_down_;
     double self_double_cylinder_radius_, self_double_cylinder_offset_;
     double body_height_;
